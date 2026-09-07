@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FPV Drone Simulator</title>
+<style>
+  /* ------------------------------------------------------------------
+     Global shell styling. All in-game UI (HUD, menus, toasts) is built as
+     DOM overlays on top of a single full-screen WebGL canvas, so the 3D
+     renderer never has to rasterise text.
+     ------------------------------------------------------------------ */
+  :root {
+    --osd:        #4dffa6;   /* classic FPV goggle green */
+    --osd-dim:    #2fae72;
+    --warn:       #ffcf4d;
+    --danger:     #ff4d4d;
+    --ink:        #e8f2ec;
+    --panel:      rgba(9, 16, 13, 0.93);
+    --panel-edge: rgba(77, 255, 166, 0.35);
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, "Courier New", monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #05080a; color: var(--ink);
+    font-family: var(--mono);
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;
+  }
+
+  #app { position: fixed; inset: 0; }
+  #canvas-container { position: absolute; inset: 0; }
+  #canvas-container canvas { display: block; width: 100%; height: 100%; }
+
+  /* Overlay layers are click-through by default so the canvas keeps focus;
+     individual interactive widgets re-enable pointer events. */
+  .layer { position: absolute; inset: 0; pointer-events: none; }
+  .layer.interactive { pointer-events: auto; }
+
+  /* ---------------------------- HUD / OSD ---------------------------- */
+  #hud {
+    font-size: 14px; letter-spacing: 0.06em; color: var(--osd);
+    text-shadow: 0 0 4px rgba(0,0,0,0.95), 0 1px 2px rgba(0,0,0,0.9);
+    transition: opacity 140ms ease;
+  }
+  #hud.hidden { opacity: 0; }
+
+  .hud-corner { position: absolute; padding: 18px 22px; line-height: 1.55; white-space: pre; }
+  .hud-tl { top: 0; left: 0; }
+  .hud-tr { top: 0; right: 0; text-align: right; }
+  .hud-bl { bottom: 0; left: 0; }
+  .hud-br { bottom: 0; right: 0; text-align: right; }
+
+  .hud-label { color: var(--osd-dim); font-size: 11px; letter-spacing: 0.16em; }
+  .hud-big   { font-size: 26px; font-weight: 700; line-height: 1.15; }
+  .hud-med   { font-size: 17px; font-weight: 600; }
+  .hud-warn  { color: var(--warn); }
+  .hud-danger{ color: var(--danger); }
+  .blink { animation: blink 0.75s steps(2, start) infinite; }
+  @keyframes blink { to { visibility: hidden; } }
+
+  #reticle { position: absolute; left: 50%; top: 50%; width: 42px; height: 42px; margin: -21px 0 0 -21px; opacity: 0.8; }
+  #reticle .h, #reticle .v { position: absolute; background: var(--osd); box-shadow: 0 0 3px rgba(0,0,0,0.9); }
+  #reticle .v { left: 50%; top: 0; width: 1px; height: 100%; margin-left: -0.5px; }
+  #reticle .h { top: 50%; left: 0; height: 1px; width: 100%; margin-top: -0.5px; }
+  #reticle .dot {
+    position: absolute; left: 50%; top: 50%; width: 5px; height: 5px;
+    margin: -2.5px 0 0 -2.5px; border: 1px solid var(--osd); border-radius: 50%;
+    background: rgba(5,8,10,0.6);
+  }
+
+  /* Artificial-horizon ladder: an SVG group rotated/translated each frame. */
+  #horizon { position: absolute; inset: 0; overflow: hidden; opacity: 0.5; }
+  #horizon svg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+
+  #center-status {
+    position: absolute; left: 0; right: 0; top: 57%; text-align: center;
+    font-size: 30px; font-weight: 800; letter-spacing: 0.22em; color: var(--danger);
+    text-shadow: 0 0 12px rgba(0,0,0,1);
+  }
+  #center-status .sub {
+    display: block; margin-top: 8px; font-size: 13px; font-weight: 500;
+    letter-spacing: 0.14em; color: var(--ink); opacity: 0.85;
+  }
+
+  #crash-flash { position: absolute; inset: 0; background: var(--danger); opacity: 0; }
+
+  /* ---------------------------- Toasts ---------------------------- */
+  #toast-root {
+    position: absolute; left: 50%; top: 22px; transform: translateX(-50%);
+    display: flex; flex-direction: column; gap: 8px; align-items: center;
+  }
+  .toast {
+    background: var(--panel); border: 1px solid var(--panel-edge);
+    border-left: 3px solid var(--osd); padding: 9px 16px; font-size: 12.5px;
+    letter-spacing: 0.05em; border-radius: 3px; color: var(--ink);
+    animation: toast-in 200ms ease-out; max-width: 70vw;
+  }
+  .toast.warn   { border-left-color: var(--warn); }
+  .toast.danger { border-left-color: var(--danger); }
+  .toast.fading { opacity: 0; transition: opacity 320ms ease; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } }
+
+  /* ---------------------------- Menus ---------------------------- */
+  #menu-root {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at center, rgba(5,10,8,0.86), rgba(2,4,3,0.97));
+    overflow-y: auto; padding: 32px 16px;
+  }
+  #menu-root.open { display: flex; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 6px;
+    padding: 26px 30px; width: min(880px, 94vw); max-height: 92vh; overflow-y: auto;
+    box-shadow: 0 20px 70px rgba(0,0,0,0.7), inset 0 0 60px rgba(77,255,166,0.03);
+  }
+  .panel h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0.2em; color: var(--osd); font-weight: 800; }
+  .panel h2 {
+    margin: 22px 0 10px; font-size: 12px; letter-spacing: 0.2em; color: var(--osd-dim);
+    font-weight: 700; text-transform: uppercase;
+    border-bottom: 1px solid rgba(77,255,166,0.16); padding-bottom: 6px;
+  }
+  .panel .tagline { margin: 0 0 8px; font-size: 12px; color: rgba(232,242,236,0.55); letter-spacing: 0.1em; }
+
+  .map-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 12px; margin-top: 6px; }
+  .map-card {
+    border: 1px solid rgba(77,255,166,0.22); border-radius: 5px; padding: 14px 16px;
+    cursor: pointer; background: rgba(77,255,166,0.03); text-align: left;
+    transition: border-color 120ms, background 120ms, transform 120ms;
+  }
+  .map-card:hover { border-color: var(--osd); background: rgba(77,255,166,0.09); transform: translateY(-2px); }
+  .map-card.selected { border-color: var(--osd); background: rgba(77,255,166,0.14); }
+  .map-card .name { font-size: 14px; font-weight: 700; color: var(--osd); letter-spacing: 0.1em; }
+  .map-card .desc { font-size: 11.5px; color: rgba(232,242,236,0.62); margin-top: 6px; line-height: 1.5; }
+  .map-card .thumb { height: 62px; border-radius: 3px; margin-bottom: 10px; border: 1px solid rgba(255,255,255,0.06); }
+
+  .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+  button.ui {
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.14em;
+    text-transform: uppercase; font-weight: 700; padding: 11px 20px; border-radius: 4px;
+    cursor: pointer; background: rgba(77,255,166,0.10); color: var(--osd);
+    border: 1px solid rgba(77,255,166,0.4);
+    transition: background 120ms, color 120ms, border-color 120ms;
+  }
+  button.ui:hover { background: var(--osd); color: #04120c; }
+  button.ui.primary { background: var(--osd); color: #04120c; }
+  button.ui.primary:hover { background: #7effc2; }
+  button.ui.ghost { background: transparent; color: rgba(232,242,236,0.7); border-color: rgba(232,242,236,0.22); }
+  button.ui.ghost:hover { background: rgba(232,242,236,0.12); color: var(--ink); }
+  button.ui.small { padding: 6px 12px; font-size: 11px; letter-spacing: 0.1em; }
+  button.ui:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .row { display: flex; align-items: center; gap: 14px; padding: 7px 0; font-size: 12.5px; }
+  .row > label:first-child { flex: 0 0 210px; color: rgba(232,242,236,0.8); letter-spacing: 0.06em; }
+  .row input[type=range] { flex: 1; accent-color: var(--osd); min-width: 110px; }
+  .row .val { flex: 0 0 78px; text-align: right; color: var(--osd); font-variant-numeric: tabular-nums; }
+  .row select, .row input[type=text] {
+    font-family: var(--mono); font-size: 12px; padding: 6px 9px; border-radius: 3px;
+    background: rgba(0,0,0,0.45); color: var(--ink); border: 1px solid rgba(77,255,166,0.3);
+  }
+  .row input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--osd); }
+
+  .kv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .kv-table td { padding: 4px 8px 4px 0; vertical-align: top; }
+  .kv-table td.k { color: var(--osd); white-space: nowrap; width: 132px; font-weight: 600; }
+  .kv-table td.v { color: rgba(232,242,236,0.72); }
+
+  .cols2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px 34px; }
+
+  .tabs { display: flex; gap: 6px; margin: 16px 0 4px; flex-wrap: wrap; }
+  .tab {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.13em; text-transform: uppercase;
+    padding: 8px 14px; cursor: pointer; border-radius: 3px; font-weight: 700;
+    background: transparent; color: rgba(232,242,236,0.5); border: 1px solid transparent;
+  }
+  .tab:hover { color: var(--ink); }
+  .tab.active { color: var(--osd); border-color: rgba(77,255,166,0.35); background: rgba(77,255,166,0.08); }
+  .tab-page { display: none; }
+  .tab-page.active { display: block; }
+
+  /* ------------------- Controller diagnostics ------------------- */
+  #diag {
+    position: absolute; right: 16px; bottom: 92px; width: 312px;
+    background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 5px;
+    padding: 12px 14px; font-size: 11px; display: none; max-height: 74vh; overflow-y: auto;
+  }
+  #diag.open { display: block; }
+  #diag .title { color: var(--osd); font-weight: 700; letter-spacing: 0.16em; font-size: 11px; margin-bottom: 8px; }
+  .stick-pair { display: flex; gap: 12px; justify-content: center; margin: 8px 0 10px; }
+  .stick-box { text-align: center; }
+  .stick-box canvas { display: block; border-radius: 50%; background: rgba(0,0,0,0.4); border: 1px solid rgba(77,255,166,0.28); }
+  .stick-box .cap { font-size: 9.5px; color: var(--osd-dim); letter-spacing: 0.1em; margin-top: 4px; }
+  .axis-line { display: flex; align-items: center; gap: 7px; margin: 3px 0; font-variant-numeric: tabular-nums; }
+  .axis-line .nm { flex: 0 0 44px; color: var(--osd-dim); }
+  .axis-line .bar { flex: 1; height: 6px; background: rgba(255,255,255,0.07); border-radius: 3px; position: relative; overflow: hidden; }
+  .axis-line .bar i { position: absolute; top: 0; bottom: 0; background: var(--osd); }
+  .axis-line .nv { flex: 0 0 48px; text-align: right; color: var(--ink); }
+  .btn-grid { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+  .btn-dot {
+    width: 21px; height: 18px; border-radius: 3px; font-size: 9px;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.07); color: rgba(232,242,236,0.5); border: 1px solid transparent;
+  }
+  .btn-dot.on { background: var(--osd); color: #04120c; font-weight: 700; }
+
+  .remap-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 12px; }
+  .remap-row .fn { flex: 0 0 128px; color: rgba(232,242,236,0.85); }
+  .remap-row .bd { flex: 1; color: var(--osd); font-size: 11.5px; }
+  .remap-row.listening .bd { color: var(--warn); }
+
+  /* ---------------------------- Loading ---------------------------- */
+  #loading {
+    position: absolute; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; background: #05080a; gap: 16px; z-index: 40;
+  }
+  #loading.open { display: flex; }
+  #loading .lt { font-size: 12px; letter-spacing: 0.28em; color: var(--osd); text-transform: uppercase; }
+  #loading .lb { width: min(340px, 70vw); height: 3px; background: rgba(77,255,166,0.14); border-radius: 2px; overflow: hidden; }
+  #loading .lb i { display: block; height: 100%; width: 0%; background: var(--osd); transition: width 130ms linear; }
+  #loading .ls { font-size: 11px; color: rgba(232,242,236,0.45); letter-spacing: 0.1em; }
+
+  /* Fatal-error card. The app tries very hard never to reach this. */
+  #fatal {
+    position: absolute; inset: 0; display: none; z-index: 60;
+    align-items: center; justify-content: center; background: #05080a; padding: 24px;
+  }
+  #fatal.open { display: flex; }
+  #fatal .panel { border-color: rgba(255,77,77,0.4); }
+  #fatal h1 { color: var(--danger); }
+  #fatal pre {
+    font-size: 11px; color: rgba(232,242,236,0.6); white-space: pre-wrap;
+    max-height: 220px; overflow-y: auto; background: rgba(0,0,0,0.4); padding: 10px; border-radius: 3px;
+  }
+
+  .hint { font-size: 11px; color: rgba(232,242,236,0.42); line-height: 1.6; letter-spacing: 0.04em; }
+  kbd {
+    font-family: var(--mono); font-size: 10.5px; padding: 2px 6px; border-radius: 3px;
+    background: rgba(77,255,166,0.13); border: 1px solid rgba(77,255,166,0.3);
+    color: var(--osd); white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+  <div id="app">
+    <div id="canvas-container"></div>
+
+    <!-- HUD / OSD overlay (populated by ui/HUD.js) -->
+    <div class="layer" id="hud"></div>
+
+    <div class="layer" id="crash-flash"></div>
+    <div class="layer" id="toast-root"></div>
+
+    <!-- Controller diagnostics (populated by ui/ControllerDiagnostics.js) -->
+    <div class="layer" id="diag-layer">
+      <div id="diag" style="pointer-events:auto;"></div>
+    </div>
+
+    <!-- Main / pause menus (populated by ui/MainMenu.js and ui/PauseMenu.js) -->
+    <div class="layer interactive" id="menu-root"></div>
+
+    <div id="loading">
+      <div class="lt">Building environment</div>
+      <div class="lb"><i></i></div>
+      <div class="ls">&nbsp;</div>
+    </div>
+
+    <div id="fatal">
+      <div class="panel">
+        <h1>Simulator halted</h1>
+        <p class="tagline">Something went wrong that could not be recovered automatically.</p>
+        <pre id="fatal-msg"></pre>
+        <div class="btn-row">
+          <button class="ui primary" id="fatal-reload">Reload</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "fpv-sim",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Browser-based FPV drone flight simulator: rate-based acro flight model, three procedural maps, keyboard + Gamepad API input.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node tests/flight-model.test.mjs"
+  },
+  "dependencies": {
+    "cannon-es": "0.20.0",
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "vite": "8.2.2"
+  }
+}
