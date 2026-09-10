@@ -52,7 +52,9 @@ export class HouseMap {
     this.id = 'house';
 
     // Spawn in the garage, nose pointed down the house toward the living room.
-    this.spawnPoint = new THREE.Vector3(-4.8, 1.0, 5.6);
+    // Sat on the garage floor. Spawning airborne would mean the quad free-
+    // falls and registers a crash before the pilot has touched anything.
+    this.spawnPoint = new THREE.Vector3(-4.8, 0.12, 5.6);
     this.spawnHeading = 0;          // local -Z is forward, so this faces -Z
     this.groundLevel = 0;
 
@@ -66,6 +68,9 @@ export class HouseMap {
     this._prevFog = null;
     this._prevBackground = null;
     this._flicker = null;
+    this._dust = null;
+    this._dustVel = null;
+    this._dustPhase = 0;
   }
 
   getGroundHeight() {
@@ -108,6 +113,7 @@ export class HouseMap {
 
     yield { progress: 0.86, label: 'Lighting' };
     this._buildLighting(b);
+    this._buildDust(b);
 
     yield { progress: 0.94, label: 'Course' };
     this._buildGates(b);
@@ -532,24 +538,67 @@ export class HouseMap {
     b.addLight(pointLight(0xe8eef5, 3.5, 7, [0.5, 2.4, -5.0]));
   }
 
-  /** Living room -> hallway -> kitchen island -> bedroom -> garage. */
+  /**
+   * Dust motes: a light indoor haze cloud, much sparser than the warehouse's
+   * (real air indoors is far cleaner) but enough to catch window light and
+   * to visibly kick up under the prop wash.
+   */
+  _buildDust(b) {
+    const COUNT = 300;
+    const positions = new Float32Array(COUNT * 3);
+    const vel = new Float32Array(COUNT * 3);
+
+    for (let i = 0; i < COUNT; i++) {
+      positions[i * 3] = rnd(b, -HALF_W + 0.4, HALF_W - 0.4);
+      positions[i * 3 + 1] = rnd(b, 0.15, CEIL - 0.15);
+      positions[i * 3 + 2] = rnd(b, -HALF_D + 0.4, HALF_D - 0.4);
+      vel[i * 3] = rnd(b, -0.03, 0.03);
+      vel[i * 3 + 1] = rnd(b, -0.015, 0.02);
+      vel[i * 3 + 2] = rnd(b, -0.03, 0.03);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    b._looseGeometries.add(geo);
+
+    const mat = b.material('dust', () => new THREE.PointsMaterial({
+      color: 0xe8e2d0,
+      size: 0.02,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.5,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+    }));
+
+    this._dust = new THREE.Points(geo, mat);
+    this._dust.frustumCulled = false;
+    b.root.add(this._dust);
+    this._dustVel = vel;
+  }
+
+  /**
+   * Living room -> hallway -> kitchen island -> bedroom -> hallway -> garage.
+   *
+   * Gate positions sit in open room space rather than in the doorways: the
+   * doorways are already the hard part, and a ring inside a 0.95 m opening
+   * would leave no room to correct. Headings come from the racing line.
+   */
   _buildGates(b) {
     const layout = [
-      { x: -4.0, y: 1.25, z: 1.2, ry: Math.PI / 2, r: 0.62 },   // living room
-      { x: 0.5, y: 1.25, z: -1.0, ry: 0, r: 0.55 },             // hallway
-      { x: -3.4, y: 1.55, z: -4.6, ry: Math.PI / 2, r: 0.6 },   // over the island
-      { x: 4.2, y: 1.35, z: -3.0, ry: 0, r: 0.62 },             // bedroom 1
-      { x: 0.5, y: 1.3, z: 4.6, ry: 0, r: 0.55 },               // hallway north
-      { x: -4.8, y: 1.3, z: 4.6, ry: Math.PI / 2, r: 0.62 },    // garage finish
+      { x: -5.1, y: 1.25, z: 0.9, r: 0.62 },    // living room, through from the garage
+      { x: -0.5, y: 1.25, z: 0.1, r: 0.55 },    // living room -> hallway opening
+      { x: -3.4, y: 1.60, z: -4.6, r: 0.60 },   // over the kitchen island
+      { x: 4.2, y: 1.35, z: -4.5, r: 0.62 },    // bedroom 1
+      { x: 0.5, y: 1.30, z: 3.2, r: 0.55 },     // back up the hallway
+      { x: -4.8, y: 1.30, z: 5.2, r: 0.62 },    // garage finish
     ];
 
-    this.gates = layout.map((g, i) => b.gate({
-      position: [g.x, g.y, g.z],
-      rotationY: g.ry,
-      radius: g.r,
+    this.gates = b.course(layout, {
+      spawn: { x: this.spawnPoint.x, z: this.spawnPoint.z },
       tube: 0.04,
-      index: i,
-    }));
+    });
   }
 
   /* ====================================================================== *
@@ -565,11 +614,71 @@ export class HouseMap {
     }
   }
 
+  /**
+   * Dust kick-up: points within 2 m of the drone get pushed away and up,
+   * scaled by average motor load and inverse-square distance. Everything
+   * else drifts on its slow ambient velocity plus a gentle wobble. Called
+   * by the main loop each frame; args are optional and guarded so a missing
+   * drone reference or a bad dt just falls back to ambient drift.
+   */
+  updatePropwash(dronePos, avgMotor, dt) {
+    if (!this._dust || !this._dustVel) return;
+    const dtc = Number.isFinite(dt) && dt > 0 ? Math.min(dt, 0.1) : 0;
+    if (dtc <= 0) return;
+    this._dustPhase = (Number.isFinite(this._dustPhase) ? this._dustPhase : 0) + dtc;
+    const t = this._dustPhase;
+
+    const pos = this._dust.geometry.attributes.position;
+    const arr = pos.array;
+    const v = this._dustVel;
+    const motor = Number.isFinite(avgMotor) ? Math.max(0, Math.min(1, avgMotor)) : 0;
+    const dx0 = dronePos && Number.isFinite(dronePos.x) ? dronePos.x : null;
+    const dy0 = dronePos && Number.isFinite(dronePos.y) ? dronePos.y : null;
+    const dz0 = dronePos && Number.isFinite(dronePos.z) ? dronePos.z : null;
+    const hasDrone = dx0 !== null && dy0 !== null && dz0 !== null;
+
+    for (let i = 0; i < arr.length; i += 3) {
+      let px = arr[i], py = arr[i + 1], pz = arr[i + 2];
+
+      if (hasDrone && motor > 0.02) {
+        const ddx = px - dx0, ddy = py - dy0, ddz = pz - dz0;
+        const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (d2 < 4) {
+          const d = Math.sqrt(d2) || 0.001;
+          const kick = (motor / (1 + d2)) * dtc * 3;
+          px += (ddx / d) * kick;
+          py += ((ddy / d) * 0.5 + 0.7) * kick;
+          pz += (ddz / d) * kick;
+        }
+      }
+
+      px += v[i] * dtc + Math.sin(t * 0.6 + i) * 0.004 * dtc;
+      py += v[i + 1] * dtc;
+      pz += v[i + 2] * dtc + Math.cos(t * 0.5 + i) * 0.004 * dtc;
+
+      if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) {
+        px = (Math.random() - 0.5) * HALF_W;
+        py = CEIL * 0.5 + Math.random() * CEIL * 0.4;
+        pz = (Math.random() - 0.5) * HALF_D;
+      }
+
+      if (px < -HALF_W + 0.3) px = HALF_W - 0.3; else if (px > HALF_W - 0.3) px = -HALF_W + 0.3;
+      if (py < 0.1) py = CEIL - 0.1; else if (py > CEIL - 0.1) py = 0.1;
+      if (pz < -HALF_D + 0.3) pz = HALF_D - 0.3; else if (pz > HALF_D - 0.3) pz = -HALF_D + 0.3;
+
+      arr[i] = px; arr[i + 1] = py; arr[i + 2] = pz;
+    }
+    pos.needsUpdate = true;
+  }
+
   dispose(scene, physics) {
     if (this.builder) this.builder.dispose(scene, physics);
     this.builder = null;
     this._mats = null;
     this._flicker = null;
+    this._dust = null;
+    this._dustVel = null;
+    this._dustPhase = 0;
     this.gates = [];
     scene.background = this._prevBackground ?? null;
     scene.fog = this._prevFog ?? null;

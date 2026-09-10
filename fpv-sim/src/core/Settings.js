@@ -20,17 +20,25 @@
  *     model, so every field is coerced and range-checked on load.
  */
 
-const STORAGE_KEY = 'fpv-sim.settings.v1';
+import { DRONE_TYPE_IDS, DEFAULT_DRONE_TYPE, getAirframe } from './DroneTypes.js';
+
+const STORAGE_KEY = 'fpv-sim.settings.v2';
 
 /** Factory so every caller gets an independent copy — no shared nested refs. */
 export function defaultSettings() {
   return {
+    /* ---- airframe ---- */
+    droneType: DEFAULT_DRONE_TYPE,   // 'tinywhoop' | 'freestyle' | 'racer'
+
     /* ---- input ---- */
     inputMode: 'auto',          // 'auto' | 'keyboard' | 'gamepad'
     deadzone: 0.10,             // 0.00 – 0.40, rescaled (not merely clipped)
     expo: 0.50,                 // 0.00 – 1.00 stick curve
     sensitivity: { roll: 1.0, pitch: 1.0, yaw: 1.0 },
-    rates: { roll: 600, pitch: 600, yaw: 400 },  // deg/s at full deflection
+    // Seeded from the default airframe; `loadAirframeProfile()` rewrites these
+    // whenever the pilot changes craft, exactly as a flight controller loads a
+    // per-craft profile. The sliders then edit the loaded values.
+    rates: { ...getAirframe(DEFAULT_DRONE_TYPE).rates },
     springThrottle: false,      // true for spring-centred gamepad sticks
     gamepadMapping: defaultGamepadMapping(),
 
@@ -41,10 +49,39 @@ export function defaultSettings() {
     simRate: 240,               // 120 | 240 | 480 | 960
     adaptiveQuality: true,      // drop render resolution before dropping ticks
 
-    /* ---- flight ---- */
-    flightMode: 'angle',        // 'angle' (assisted) | 'acro' (rate-only)
-    maxTilt: 35,                // deg, Angle-mode tilt ceiling
+    flightMode: 'angle',        // 'angle' (assisted) | 'acro' (rate-only) | 'horizon'
+    maxTilt: getAirframe(DEFAULT_DRONE_TYPE).maxTilt,   // deg, Angle-mode ceiling
     wind: false,                // Field map only
+    windSpeed: 2.5,             // m/s, 0..12 (Dryden-lite turbulence base)
+    windGust: 0.5,              // 0..1 gust intensity scale
+
+    // Betaflight-style rate curve. `rates` above stays the deg/s ceiling;
+    // this shapes the curve under it. `useLegacy` reverts to `cmd*maxRate`.
+    rateProfile: {
+      roll: { rcRate: 1.0, superRate: 0.75, expo: 0.0 },
+      pitch: { rcRate: 1.0, superRate: 0.75, expo: 0.0 },
+      yaw: { rcRate: 1.0, superRate: 0.65, expo: 0.0 },
+      useLegacy: false,
+    },
+    tpa: { start: 0.65, amount: 0.35 },   // throttle-PID-attenuation
+    feedforward: 0.35,          // 0..1
+    airmode: true,              // full authority at max throttle
+    horizonBlend: 0.5,          // 0..1, angle/acro blend in Horizon mode
+
+    /* ---- rc link ---- */
+    rcLatencyMs: 12,            // 0..60
+    rcLoss: 0,                  // 0..5 %
+
+    /* ---- fpv video ---- */
+    fpvLatency: 28,             // 0..60 ms
+    vtxBreakup: true,           // signal noise/tearing with distance
+
+    /* ---- environment ---- */
+    sunAngle: 0.5,              // 0..1
+    overcast: 0,                // 0..1
+
+    /* ---- telemetry ---- */
+    blackbox: false,
 
     /* ---- camera ---- */
     fov: 130,                   // deg, 90–150
@@ -66,17 +103,26 @@ export function defaultSettings() {
   };
 }
 
-/** Mode 2 layout, matching a real FPV transmitter and the spec's table. */
+/**
+ * Mode 2 layout, matching a real FPV transmitter and the spec's table.
+ *
+ * Axis bindings store the raw value at each end of travel (`lo` -> minimum
+ * output, `hi` -> maximum) rather than an invert flag. One linear map then
+ * covers a normal stick, a reversed one, and a partial-range transmitter pot,
+ * and guided calibration can write measured endpoints straight in.
+ *
+ * These defaults are correct for a browser-reported `mapping: "standard"` pad.
+ * Anything else is driver-defined and may need calibration.
+ */
 export function defaultGamepadMapping() {
   return {
-    // `unipolar` maps a centre-resting ±1 axis onto 0..1 via (1 - v) / 2,
-    // which is what a throttle needs: up = full, down = cut.
-    throttle: { type: 'axis', index: 1, invert: false, mode: 'unipolar' },
-    yaw:      { type: 'axis', index: 0, invert: false, mode: 'bipolar' },
+    // Stick pushed up reports -1, and up must mean full power.
+    throttle: { type: 'axis', index: 1, lo: 1,  hi: -1, mode: 'unipolar' },
+    yaw:      { type: 'axis', index: 0, lo: -1, hi: 1,  mode: 'bipolar' },
     // Right-stick Y reports -1 when pushed away from the pilot, and pushing
-    // away must mean "pitch forward", so this one axis is inverted.
-    pitch:    { type: 'axis', index: 3, invert: true,  mode: 'bipolar' },
-    roll:     { type: 'axis', index: 2, invert: false, mode: 'bipolar' },
+    // away must mean "pitch forward".
+    pitch:    { type: 'axis', index: 3, lo: 1,  hi: -1, mode: 'bipolar' },
+    roll:     { type: 'axis', index: 2, lo: -1, hi: 1,  mode: 'bipolar' },
 
     arm:      { type: 'button', index: 0 },
     reset:    { type: 'button', index: 1 },
@@ -147,6 +193,7 @@ function sanitize(raw) {
   const d = defaultSettings();
   if (!raw || typeof raw !== 'object') return d;
 
+  d.droneType = oneOf(raw.droneType, DRONE_TYPE_IDS, d.droneType);
   d.inputMode = oneOf(raw.inputMode, ['auto', 'keyboard', 'gamepad'], d.inputMode);
   d.deadzone = num(raw.deadzone, 0, 0.4, d.deadzone);
   d.expo = num(raw.expo, 0, 1, d.expo);
@@ -168,9 +215,41 @@ function sanitize(raw) {
   d.simRate = [120, 240, 480, 960].includes(raw.simRate) ? raw.simRate : d.simRate;
   d.adaptiveQuality = bool(raw.adaptiveQuality, d.adaptiveQuality);
 
-  d.flightMode = oneOf(raw.flightMode, ['angle', 'acro'], d.flightMode);
+  d.flightMode = oneOf(raw.flightMode, ['angle', 'acro', 'horizon'], d.flightMode);
   d.maxTilt = num(raw.maxTilt, 10, 75, d.maxTilt);
   d.wind = bool(raw.wind, d.wind);
+  d.windSpeed = num(raw.windSpeed, 0, 12, d.windSpeed);
+  d.windGust = num(raw.windGust, 0, 1, d.windGust);
+
+  if (raw.rateProfile && typeof raw.rateProfile === 'object') {
+    for (const axis of ['roll', 'pitch', 'yaw']) {
+      const src = raw.rateProfile[axis];
+      if (src && typeof src === 'object') {
+        d.rateProfile[axis].rcRate = num(src.rcRate, 0.5, 2.5, d.rateProfile[axis].rcRate);
+        d.rateProfile[axis].superRate = num(src.superRate, 0, 1, d.rateProfile[axis].superRate);
+        d.rateProfile[axis].expo = num(src.expo, 0, 1, d.rateProfile[axis].expo);
+      }
+    }
+    d.rateProfile.useLegacy = bool(raw.rateProfile.useLegacy, d.rateProfile.useLegacy);
+  }
+  if (raw.tpa && typeof raw.tpa === 'object') {
+    d.tpa.start = num(raw.tpa.start, 0, 1, d.tpa.start);
+    d.tpa.amount = num(raw.tpa.amount, 0, 0.6, d.tpa.amount);
+  }
+  d.feedforward = num(raw.feedforward, 0, 1, d.feedforward);
+  d.airmode = bool(raw.airmode, d.airmode);
+  d.horizonBlend = num(raw.horizonBlend, 0, 1, d.horizonBlend);
+
+  d.rcLatencyMs = num(raw.rcLatencyMs, 0, 60, d.rcLatencyMs);
+  d.rcLoss = num(raw.rcLoss, 0, 5, d.rcLoss);
+
+  d.fpvLatency = num(raw.fpvLatency, 0, 60, d.fpvLatency);
+  d.vtxBreakup = bool(raw.vtxBreakup, d.vtxBreakup);
+
+  d.sunAngle = num(raw.sunAngle, 0, 1, d.sunAngle);
+  d.overcast = num(raw.overcast, 0, 1, d.overcast);
+
+  d.blackbox = bool(raw.blackbox, d.blackbox);
 
   d.fov = num(raw.fov, 70, 155, d.fov);
   d.cameraTilt = num(raw.cameraTilt, 0, 55, d.cameraTilt);
@@ -207,12 +286,24 @@ function sanitizeMapping(raw) {
     if (!Number.isInteger(index)) continue;
 
     if (type === 'axis') {
-      d[key] = {
-        type: 'axis',
-        index,
-        invert: bool(b.invert, false),
-        mode: oneOf(b.mode, ['bipolar', 'unipolar'], key === 'throttle' ? 'unipolar' : 'bipolar'),
-      };
+      const mode = oneOf(b.mode, ['bipolar', 'unipolar'], key === 'throttle' ? 'unipolar' : 'bipolar');
+      const binding = { type: 'axis', index, mode };
+
+      // Calibrated endpoints win; otherwise fall back to the legacy invert
+      // flag so a mapping stored by an older build still loads.
+      const lo = num(b.lo, -1, 1, NaN);
+      const hi = num(b.hi, -1, 1, NaN);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && Math.abs(hi - lo) > 0.2) {
+        binding.lo = lo;
+        binding.hi = hi;
+      } else if (bool(b.invert, false)) {
+        binding.lo = 1;
+        binding.hi = -1;
+      } else {
+        binding.lo = -1;
+        binding.hi = 1;
+      }
+      d[key] = binding;
     } else {
       d[key] = { type: 'button', index };
     }
@@ -265,6 +356,30 @@ class SettingsStore {
 
     this.save();
     this._emit(Object.keys(patch));
+  }
+
+  /**
+   * Adopt an airframe's rate and tilt profile.
+   *
+   * Rates are a property of the craft, not of the pilot: 900 deg/s is right for
+   * a race quad and unflyable on a whoop. Switching craft therefore reloads the
+   * profile, and the settings sliders go on editing whatever is loaded.
+   */
+  loadAirframeProfile(droneType) {
+    const spec = getAirframe(droneType);
+    const superRateByType = { tinywhoop: 0.6, freestyle: 0.75, racer: 0.85 };
+    const superRate = num(superRateByType[spec.id], 0, 1, 0.75);
+    this.set({
+      droneType: spec.id,
+      rates: { ...spec.rates },
+      maxTilt: spec.maxTilt,
+      rateProfile: {
+        roll: { rcRate: 1.0, superRate, expo: 0.0 },
+        pitch: { rcRate: 1.0, superRate, expo: 0.0 },
+        yaw: { rcRate: 1.0, superRate: 0.65, expo: 0.0 },
+        useLegacy: this.values.rateProfile?.useLegacy ?? false,
+      },
+    });
   }
 
   /** Record a Time Trial best, keeping only an improvement. */

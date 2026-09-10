@@ -69,6 +69,12 @@ export class PhysicsWorld {
 
     /** Last known-good transform for each body we are protecting. */
     this._safeState = new WeakMap();
+
+    /* Continuous-collision scratch. Allocated once — the sweep runs on every
+     * substep of every protected body. */
+    this._rayFrom = new CANNON.Vec3();
+    this._rayTo = new CANNON.Vec3();
+    this._rayResult = new CANNON.RaycastResult();
   }
 
   /* ---------------------------------------------------------------------- *
@@ -157,6 +163,86 @@ export class PhysicsWorld {
       position: body.position.clone(),
       quaternion: body.quaternion.clone(),
     });
+
+    // Smallest half-extent of the body, used as the swept-collision threshold
+    // and as the stand-off distance when we stop it at a surface.
+    let radius = 0.05;
+    try {
+      const shape = body.shapes?.[0];
+      if (shape?.halfExtents) {
+        radius = Math.min(shape.halfExtents.x, shape.halfExtents.y, shape.halfExtents.z);
+      } else if (Number.isFinite(shape?.radius)) {
+        radius = shape.radius;
+      }
+    } catch (_e) { /* fall back to the default */ }
+    body._ccdRadius = Math.max(0.005, radius);
+  }
+
+  /**
+   * Swept-collision guard (a cheap continuous-collision pass).
+   *
+   * Discrete collision detection compares *positions*, so a body that travels
+   * further in one substep than the thickness of what it hits can end up on the
+   * far side without a contact ever being generated. At 1/120 s a 23 g whoop
+   * moving 12 m/s covers 0.10 m per step against 0.14 m interior walls — right
+   * on the edge — and it does in fact pass straight through them.
+   *
+   * The generic clamps cannot catch this: MAX_POSITION_DELTA is metres, and any
+   * value tight enough to notice a 37 mm body would fire constantly in normal
+   * flight. So instead we cast a ray along the path the body actually took and,
+   * if it crossed something solid, put it back at the surface.
+   *
+   * Only runs when the step's travel exceeds the body's own smallest half-
+   * extent, which is exactly the regime where discrete detection is unreliable
+   * — so it costs one raycast per substep at speed and nothing at a hover.
+   *
+   * @returns {number} impact speed along the surface normal, or 0 for no hit
+   */
+  _sweepGuard(body, from) {
+    const to = body.position;
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dz = to.z - from.z;
+    const dist2 = dx * dx + dy * dy + dz * dz;
+
+    const r = body._ccdRadius || 0.05;
+    if (dist2 < r * r) return 0;          // short hop: discrete detection is fine
+
+    try {
+      this._rayFrom.set(from.x, from.y, from.z);
+      this._rayTo.set(to.x, to.y, to.z);
+      this._rayResult.reset();
+
+      this.world.raycastClosest(this._rayFrom, this._rayTo, RAY_OPTIONS, this._rayResult);
+      if (!this._rayResult.hasHit) return 0;
+
+      const hit = this._rayResult.hitPointWorld;
+      const n = this._rayResult.hitNormalWorld;
+      if (!isFiniteVec(hit) || !isFiniteVec(n)) return 0;
+
+      // Speed into the surface, for the caller's crash test.
+      const vn = body.velocity.x * n.x + body.velocity.y * n.y + body.velocity.z * n.z;
+      const impact = vn < 0 ? -vn : 0;
+
+      // Park the body just clear of the surface it crossed. The next substep
+      // then resolves the contact normally, so the usual collision response and
+      // crash detection still apply — we have only prevented the pass-through.
+      body.position.set(hit.x + n.x * r * 1.05, hit.y + n.y * r * 1.05, hit.z + n.z * r * 1.05);
+
+      // Kill the inbound normal component and keep a little bounce, so the quad
+      // stops at the wall instead of grinding into it for the next few steps.
+      if (vn < 0) {
+        body.velocity.set(
+          body.velocity.x - n.x * vn * 1.2,
+          body.velocity.y - n.y * vn * 1.2,
+          body.velocity.z - n.z * vn * 1.2,
+        );
+      }
+      return impact;
+    } catch (err) {
+      console.warn('[PhysicsWorld] swept-collision guard failed; skipping.', err);
+      return 0;
+    }
   }
 
   /* ---------------------------------------------------------------------- *
@@ -271,13 +357,25 @@ export class PhysicsWorld {
       }
     }
 
+    // --- swept collision -------------------------------------------------
+    // `safe.position` still holds the pre-step position at this point, which is
+    // exactly the ray's origin.
+    let impactSpeed = 0;
+    if (safe && !healed) {
+      impactSpeed = this._sweepGuard(body, safe.position);
+      if (impactSpeed > 0) {
+        healed = true;
+        reason = 'swept collision: stopped at surface';
+      }
+    }
+
     // Everything above is finite now, so this snapshot is safe to trust.
     if (safe) {
       safe.position.copy(body.position);
       safe.quaternion.copy(body.quaternion);
     }
 
-    return { healed, reason };
+    return { healed, reason, impactSpeed };
   }
 
   /** Force a protected body's known-good snapshot — call after a respawn. */
@@ -303,6 +401,17 @@ export class PhysicsWorld {
     } catch (_e) { /* ignore */ }
   }
 }
+
+/**
+ * Ray options for the swept-collision guard. Restricting the mask to WORLD
+ * means the ray cannot hit the drone itself, and skipping backfaces stops a
+ * body that is already inside geometry from being flung back out.
+ */
+const RAY_OPTIONS = {
+  collisionFilterGroup: GROUP.DRONE,
+  collisionFilterMask: GROUP.WORLD,
+  skipBackfaces: true,
+};
 
 /* ========================================================================== *
  * Small validity helpers — hoisted so the hot path avoids closure allocation.

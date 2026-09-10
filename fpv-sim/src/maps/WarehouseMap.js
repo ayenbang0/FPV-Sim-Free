@@ -48,7 +48,7 @@ export class WarehouseMap {
     this.id = 'warehouse';
 
     // Spawn at the roller door at the south end, facing down the length.
-    this.spawnPoint = new THREE.Vector3(0, 1.3, HALF_L - 4);
+    this.spawnPoint = new THREE.Vector3(0, 0.12, HALF_L - 4);   // on the slab
     this.spawnHeading = 0;          // -Z is forward: straight down the shed
     this.groundLevel = 0;
 
@@ -63,6 +63,7 @@ export class WarehouseMap {
     this._prevBackground = null;
     this._dust = null;
     this._dustVel = null;
+    this._dustPhase = 0;
     this._flicker = null;
   }
 
@@ -537,7 +538,7 @@ export class WarehouseMap {
    * amount of extra geometry would.
    */
   _buildDust(b) {
-    const COUNT = 420;
+    const COUNT = 800;
     const positions = new Float32Array(COUNT * 3);
     const vel = new Float32Array(COUNT * 3);
 
@@ -581,23 +582,20 @@ export class WarehouseMap {
    */
   _buildGates(b) {
     const layout = [
-      { x: 0, y: 2.0, z: 18, ry: 0, r: 1.5 },              // start, down the shed
-      { x: -9.0, y: 2.2, z: 6, ry: Math.PI * 0.18, r: 1.4 },
-      { x: 0, y: 6.4, z: -4, ry: 0, r: 1.5 },              // climb over the shelving
-      { x: 13.0, y: 2.4, z: -14, ry: Math.PI * 0.5, r: 1.4 },
-      { x: 0, y: 2.0, z: -25, ry: Math.PI, r: 1.5 },       // hairpin at the north wall
-      { x: -13.0, y: 5.6, z: -14, ry: Math.PI * 0.5, r: 1.4 },
-      { x: -8.0, y: 2.2, z: 4, ry: Math.PI * 0.85, r: 1.4 },
-      { x: 4.9, y: 2.4, z: HALF_L - 0.6, ry: 0, r: 1.6 },  // out through the door
+      { x: 0, y: 2.0, z: 18, r: 1.5 },       // start, straight down the shed
+      { x: -9.0, y: 2.2, z: 6, r: 1.4 },
+      { x: 0, y: 6.4, z: -4, r: 1.5 },       // climb over the shelving
+      { x: 13.0, y: 2.4, z: -14, r: 1.4 },
+      { x: 0, y: 2.0, z: -25, r: 1.5 },      // hairpin at the north wall
+      { x: -13.0, y: 5.6, z: -14, r: 1.4 },
+      { x: -8.0, y: 2.2, z: 4, r: 1.4 },
+      { x: 4.9, y: 2.4, z: HALF_L - 0.6, r: 1.6 },  // out through the roller door
     ];
 
-    this.gates = layout.map((g, i) => b.gate({
-      position: [g.x, g.y, g.z],
-      rotationY: g.ry,
-      radius: g.r,
+    this.gates = b.course(layout, {
+      spawn: { x: this.spawnPoint.x, z: this.spawnPoint.z },
       tube: 0.085,
-      index: i,
-    }));
+    });
   }
 
   /* ====================================================================== *
@@ -605,31 +603,68 @@ export class WarehouseMap {
    * ====================================================================== */
 
   update(dt, elapsed) {
-    // Drift the dust, wrapping it back into the building at the edges so the
-    // cloud never thins out.
-    if (this._dust && this._dustVel) {
-      const pos = this._dust.geometry.attributes.position;
-      const arr = pos.array;
-      const v = this._dustVel;
-      for (let i = 0; i < arr.length; i += 3) {
-        arr[i] += v[i] * dt;
-        arr[i + 1] += v[i + 1] * dt;
-        arr[i + 2] += v[i + 2] * dt;
-
-        if (arr[i] < -HALF_W + 1) arr[i] = HALF_W - 1;
-        else if (arr[i] > HALF_W - 1) arr[i] = -HALF_W + 1;
-        if (arr[i + 1] < 0.2) arr[i + 1] = H - 1;
-        else if (arr[i + 1] > H - 0.5) arr[i + 1] = 0.3;
-        if (arr[i + 2] < -HALF_L + 1) arr[i + 2] = HALF_L - 1;
-        else if (arr[i + 2] > HALF_L - 1) arr[i + 2] = -HALF_L + 1;
-      }
-      pos.needsUpdate = true;
-    }
-
     if (this._flicker) {
       const f = Math.sin(elapsed * 17.7) * Math.sin(elapsed * 5.3);
       this._flicker.intensity = f > 0.42 ? 3 : 22;
     }
+  }
+
+  /**
+   * Dust kick-up: points within 2 m of the drone get pushed away and up,
+   * scaled by average motor load and inverse-square distance. Everything
+   * else drifts on its ambient velocity, wrapping back into the building at
+   * the edges so the cloud never thins out. Called by the main loop each
+   * frame; args are optional and guarded so a missing drone reference or a
+   * bad dt just falls back to ambient drift.
+   */
+  updatePropwash(dronePos, avgMotor, dt) {
+    if (!this._dust || !this._dustVel) return;
+    const dtc = Number.isFinite(dt) && dt > 0 ? Math.min(dt, 0.1) : 0;
+    if (dtc <= 0) return;
+    this._dustPhase = (Number.isFinite(this._dustPhase) ? this._dustPhase : 0) + dtc;
+    const t = this._dustPhase;
+
+    const pos = this._dust.geometry.attributes.position;
+    const arr = pos.array;
+    const v = this._dustVel;
+    const motor = Number.isFinite(avgMotor) ? Math.max(0, Math.min(1, avgMotor)) : 0;
+    const dx0 = dronePos && Number.isFinite(dronePos.x) ? dronePos.x : null;
+    const dy0 = dronePos && Number.isFinite(dronePos.y) ? dronePos.y : null;
+    const dz0 = dronePos && Number.isFinite(dronePos.z) ? dronePos.z : null;
+    const hasDrone = dx0 !== null && dy0 !== null && dz0 !== null;
+
+    for (let i = 0; i < arr.length; i += 3) {
+      let px = arr[i], py = arr[i + 1], pz = arr[i + 2];
+
+      if (hasDrone && motor > 0.02) {
+        const ddx = px - dx0, ddy = py - dy0, ddz = pz - dz0;
+        const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (d2 < 4) {
+          const d = Math.sqrt(d2) || 0.001;
+          const kick = (motor / (1 + d2)) * dtc * 3;
+          px += (ddx / d) * kick;
+          py += ((ddy / d) * 0.5 + 0.7) * kick;
+          pz += (ddz / d) * kick;
+        }
+      }
+
+      px += v[i] * dtc + Math.sin(t * 0.6 + i) * 0.005 * dtc;
+      py += v[i + 1] * dtc;
+      pz += v[i + 2] * dtc + Math.cos(t * 0.5 + i) * 0.005 * dtc;
+
+      if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) {
+        px = (Math.random() - 0.5) * HALF_W;
+        py = H * 0.5 + Math.random() * H * 0.3;
+        pz = (Math.random() - 0.5) * HALF_L;
+      }
+
+      if (px < -HALF_W + 1) px = HALF_W - 1; else if (px > HALF_W - 1) px = -HALF_W + 1;
+      if (py < 0.2) py = H - 1; else if (py > H - 0.5) py = 0.3;
+      if (pz < -HALF_L + 1) pz = HALF_L - 1; else if (pz > HALF_L - 1) pz = -HALF_L + 1;
+
+      arr[i] = px; arr[i + 1] = py; arr[i + 2] = pz;
+    }
+    pos.needsUpdate = true;
   }
 
   dispose(scene, physics) {
@@ -638,6 +673,7 @@ export class WarehouseMap {
     this._mats = null;
     this._dust = null;
     this._dustVel = null;
+    this._dustPhase = 0;
     this._flicker = null;
     this._skylights = null;
     this.gates = [];

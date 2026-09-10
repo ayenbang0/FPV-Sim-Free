@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node tests/flight-model.test.mjs"
+    "test": "node tests/flight-model.test.mjs && node tests/input.test.mjs"
   },
   "dependencies": {
     "cannon-es": "0.20.0",

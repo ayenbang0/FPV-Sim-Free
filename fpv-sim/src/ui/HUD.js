@@ -16,7 +16,6 @@
  * profile; this keeps the HUD effectively free.
  */
 
-import { BATT } from '../core/DroneController.js';
 import { settings } from './../core/Settings.js';
 
 export class HUD {
@@ -64,16 +63,18 @@ export class HUD {
     this.br = el('div', 'hud-corner hud-br');
     this.armState = el('div', 'hud-med');
     this.flightMode = el('div', 'hud-med');
+    this.craft = el('div', 'hud-label');
     this.cameraMode = el('div', 'hud-label');
     this.inputSource = el('div', 'hud-label');
     this.mapName = el('div', 'hud-label');
-    this.br.append(this.armState, this.flightMode, this.cameraMode, this.inputSource, this.mapName);
+    this.br.append(this.armState, this.flightMode, this.craft, this.cameraMode, this.inputSource, this.mapName);
 
     // --- centre: reticle, horizon, big status ------------------------
     this.horizon = el('div', '');
     this.horizon.id = 'horizon';
     this.horizon.innerHTML = buildHorizonSvg();
     this.ladder = this.horizon.querySelector('#ladder');
+    this.headingTape = this.horizon.querySelector('#heading-tape');
 
     this.reticle = el('div', '');
     this.reticle.id = 'reticle';
@@ -82,8 +83,21 @@ export class HUD {
     this.centerStatus = el('div', '');
     this.centerStatus.id = 'center-status';
 
+    // --- top-centre: OSD warnings + link/RSSI bar ---------------------
+    this.warnings = el('div', 'hud-med hud-danger');
+    this.warnings.id = 'hud-warnings';
+    this.warnings.style.cssText =
+      'position:absolute; top:3%; left:50%; transform:translateX(-50%); ' +
+      'text-align:center; white-space:nowrap; pointer-events:none;';
+
+    this.rssiBar = el('div', 'hud-label');
+    this.rssiBar.id = 'hud-rssi';
+    this.rssiBar.style.cssText =
+      'position:absolute; top:7%; left:50%; transform:translateX(-50%); ' +
+      'text-align:center; white-space:nowrap; pointer-events:none; display:none;';
+
     this.root.append(
-      this.horizon, this.reticle, this.centerStatus,
+      this.horizon, this.reticle, this.centerStatus, this.warnings, this.rssiBar,
       this.tl, this.tr, this.bl, this.br,
     );
   }
@@ -123,7 +137,9 @@ export class HUD {
 
     /* ---- battery ---- */
     const v = d.batteryVoltage;
-    this._set(this.battVolts, `${v.toFixed(1)}V`);
+    // Cell count matters: 4.1 V is a healthy 1S and a dead 4S, so the pack
+    // label has to sit next to the number for it to mean anything.
+    this._set(this.battVolts, `${v.toFixed(1)}V ${d.spec.battery.label}`);
     this._set(this.battBar, `${batteryBar(d.batteryCharge)}  ${Math.round(d.batteryCharge * 100)}%`);
 
     const stage = d.getBatteryStage();
@@ -163,6 +179,7 @@ export class HUD {
     this._set(this.armState, d.armed ? 'ARMED' : 'DISARMED');
     this.armState.classList.toggle('hud-danger', !d.armed);
     this._set(this.flightMode, `MODE: ${String(settings.get('flightMode')).toUpperCase()}`);
+    this._set(this.craft, `CRAFT: ${String(d.spec.displayName).toUpperCase()}`);
     this._set(this.cameraMode, `CAM: ${s.cameraLabel || 'FPV'}`);
 
     const inp = s.input || {};
@@ -176,8 +193,34 @@ export class HUD {
     else if (!d.armed) status = 'DISARMED<span class="sub">Press SPACE to arm</span>';
     this._setHtml(this.centerStatus, status);
 
+    /* ---- OSD warnings ---- */
+    const tokens = [];
+    const armed = typeof s.armed === 'boolean' ? s.armed : d.armed;
+    if (armed) tokens.push('ARMED');
+    const fm = String(s.flightMode || settings.get('flightMode') || 'angle').toLowerCase();
+    if (fm === 'horizon') tokens.push('HORIZON');
+    else if (fm === 'acro') tokens.push('ACRO');
+    else tokens.push('ANGLE');
+    if (s.linkHeld) tokens.push('HOLD');
+    if (s.failsafe) tokens.push('FAILSAFE');
+    if (stage === 'low' || stage === 'critical' || stage === 'cutoff') tokens.push('LOW BATT');
+    if (Number.isFinite(s.damage) && s.damage > 0) tokens.push(`DMG ${Math.round(clamp(s.damage, 0, 1) * 100)}%`);
+    if (Number.isFinite(s.windSpeed) && s.windSpeed > 0.1) tokens.push(`WIND ${s.windSpeed.toFixed(1)}m/s`);
+    this._set(this.warnings, tokens.join(' '));
+
+    /* ---- RSSI bar ---- */
+    if (Number.isFinite(s.rssi)) {
+      this.rssiBar.style.display = '';
+      const r = clamp(s.rssi, 0, 1);
+      const bars = Math.round(r * 10);
+      this._set(this.rssiBar, `RSSI ${'█'.repeat(bars)}${'░'.repeat(10 - bars)} ${Math.round(r * 100)}%`);
+    } else if (this.rssiBar.style.display !== 'none') {
+      this.rssiBar.style.display = 'none';
+    }
+
     /* ---- artificial horizon ---- */
     this._updateHorizon(t.rollDeg, t.pitchDeg);
+    this._updateHeadingTape(Number.isFinite(s.headingDeg) ? s.headingDeg : t.headingDeg);
   }
 
   /**
@@ -203,6 +246,23 @@ export class HUD {
     if (this._lastHorizon !== transform) {
       this._lastHorizon = transform;
       this.ladder.setAttribute('transform', transform);
+    }
+  }
+
+  /**
+   * Heading tape scroll — 24 ticks laid out every 15° along a strip that
+   * translates horizontally as the aircraft yaws, like a compass tape.
+   * Kept level (no roll/pitch), unlike the pitch ladder above.
+   */
+  _updateHeadingTape(headingDeg) {
+    if (!this.headingTape) return;
+    const hdg = Number.isFinite(headingDeg) ? ((headingDeg % 360) + 360) % 360 : 0;
+    const PX_PER_HDG = 3;
+    const tx = (-hdg * PX_PER_HDG).toFixed(1);
+    const transform = `translate(${tx} 0)`;
+    if (this._lastHeadingTape !== transform) {
+      this._lastHeadingTape = transform;
+      this.headingTape.setAttribute('transform', transform);
     }
   }
 
@@ -286,9 +346,24 @@ function buildHorizonSvg() {
     }
   }
 
+  // Heading tape: 24 ticks every 15°, laid on a scrolling strip that
+  // `_updateHeadingTape` translates horizontally as the craft yaws. Clipped
+  // to a narrow window near the top so it reads like a compass tape.
+  const PX_PER_HDG = 3;
+  const tape = [];
+  for (let deg = 0; deg < 360; deg += 15) {
+    const x = deg * PX_PER_HDG;
+    const major = deg % 90 === 0;
+    tape.push(`<line x1="${x}" y1="-218" x2="${x}" y2="${major ? -206 : -211}" stroke="currentColor" stroke-width="1"/>`);
+    if (major) {
+      tape.push(`<text x="${x}" y="-221" fill="currentColor" font-size="9" text-anchor="middle" font-family="monospace">${deg}</text>`);
+    }
+  }
+
   return `<svg width="440" height="460" viewBox="-220 -230 440 460" style="color: var(--osd)">
+    <defs><clipPath id="tape-clip"><rect x="-100" y="-226" width="200" height="22"/></clipPath></defs>
     <g id="ladder">${parts.join('')}</g>
+    <g id="heading-tape" clip-path="url(#tape-clip)">${tape.join('')}</g>
   </svg>`;
 }
 
-export { BATT };

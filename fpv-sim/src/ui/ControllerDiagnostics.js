@@ -40,6 +40,8 @@ export class ControllerDiagnostics {
     this.title = div('title', 'CONTROLLER DIAGNOSTICS');
     this.status = div('', '');
     this.status.style.cssText = 'margin-bottom:8px; color: rgba(232,242,236,0.72); line-height:1.5;';
+    this.linkLine = div('', '');
+    this.linkLine.style.cssText = 'margin-bottom:8px; color: rgba(232,242,236,0.72); line-height:1.5;';
 
     // --- stick visualisation ---
     const pair = div('stick-pair');
@@ -75,7 +77,7 @@ export class ControllerDiagnostics {
     });
 
     this.root.append(
-      this.title, this.status, pair,
+      this.title, this.status, this.linkLine, pair,
       axesLabel, this.axesHost,
       btnLabel, this.buttonsHost,
       remapLabel, this.remapHost, this.hint, resetBtn,
@@ -166,6 +168,17 @@ export class ControllerDiagnostics {
     if (this._lastStatus !== text) {
       this._lastStatus = text;
       this.status.textContent = text;
+    }
+
+    /* ---- link status ---- */
+    const latency = Number.isFinite(this.input.linkLatencyMs) ? `${Math.round(this.input.linkLatencyMs)}ms` : 'n/a';
+    const loss = Number.isFinite(this.input.linkLossPct) ? `${this.input.linkLossPct.toFixed(1)}%` : 'n/a';
+    const hold = typeof this.input.linkHeld === 'boolean' ? (this.input.linkHeld ? 'HOLD' : 'OK') : 'n/a';
+    const failsafe = typeof this.input.linkFailsafe === 'boolean' ? (this.input.linkFailsafe ? 'FAILSAFE' : 'OK') : 'n/a';
+    const linkText = `link: ${latency} ${loss} ${hold} ${failsafe}`;
+    if (this._lastLinkText !== linkText) {
+      this._lastLinkText = linkText;
+      this.linkLine.textContent = linkText;
     }
 
     /* ---- sticks ---- */

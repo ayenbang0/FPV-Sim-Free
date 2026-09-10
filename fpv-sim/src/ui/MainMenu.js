@@ -12,7 +12,9 @@
  * a bad value even if the DOM hands us something unexpected.
  */
 
-import { settings, REMAPPABLE } from '../core/Settings.js';
+import { settings, REMAPPABLE, defaultGamepadMapping } from '../core/Settings.js';
+import { CALIBRATABLE_AXES, CALIBRATION_STEPS, axisEndpoints } from '../core/InputManager.js';
+import { listAirframes, airframeStats } from '../core/DroneTypes.js';
 
 /* ========================================================================== *
  * Shared widgets
@@ -140,6 +142,8 @@ export class MainMenu {
     this.isOpen = false;
     this.root.classList.remove('open');
     this.root.innerHTML = '';
+    this.deps.input?.cancelAxisCalibration?.();
+    this._syncCalibrationTimer();
   }
 
   setSelectedMap(id) {
@@ -154,9 +158,14 @@ export class MainMenu {
 
     if (this.page === 'settings') this._renderSettings(panel);
     else if (this.page === 'controls') this._renderControls(panel);
+    else if (this.page === 'calibrate') this._renderCalibration(panel);
     else this._renderMain(panel);
 
     this.root.append(panel);
+
+    // The calibration page shows live axis values, so it needs a repaint loop
+    // for as long as it is the visible page.
+    this._syncCalibrationTimer();
   }
 
   /* ---------------------------------------------------------------------- *
@@ -204,6 +213,9 @@ export class MainMenu {
     }
     panel.append(grid);
 
+    panel.append(heading('Select an aircraft'));
+    panel.append(this._buildDronePicker());
+
     const row = document.createElement('div');
     row.className = 'btn-row';
     row.append(
@@ -219,10 +231,284 @@ export class MainMenu {
     const hint = document.createElement('p');
     hint.className = 'hint';
     hint.style.marginTop = '14px';
+    const spec = listAirframes().find((a) => a.id === settings.get('droneType')) || listAirframes()[1];
     hint.innerHTML =
-      'First time flying? Leave the mode on <strong>ANGLE</strong> — it self-levels when you let go of the sticks. ' +
-      'Press <kbd>Space</kbd> to arm, then hold <kbd>W</kbd> until you lift off (hover sits near a third of the throttle range).';
+      'First time flying? Take the <strong>Tinywhoop</strong> indoors and leave the mode on <strong>ANGLE</strong> — ' +
+      'it self-levels when you let go of the sticks. Press <kbd>Space</kbd> to arm, then hold <kbd>W</kbd> until you lift off ' +
+      `(on the ${spec.displayName}, hover sits near <strong>${Math.round(spec.hoverThrottle * 100)}%</strong> throttle).`;
     panel.append(hint);
+  }
+
+  /**
+   * Aircraft cards. Each one lists the handful of numbers that actually decide
+   * how the thing flies — thrust ratio, top speed, rates, and where hover sits
+   * on the stick — because those are what differ, and a pilot picking a craft
+   * wants to compare them rather than read prose.
+   */
+  _buildDronePicker() {
+    const grid = document.createElement('div');
+    grid.className = 'map-grid';
+
+    const current = settings.get('droneType');
+
+    for (const spec of listAirframes()) {
+      const card = document.createElement('button');
+      card.className = `map-card${spec.id === current ? ' selected' : ''}`;
+
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      thumb.style.background = spec.accent;
+
+      const name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = spec.displayName;
+
+      const desc = document.createElement('div');
+      desc.className = 'desc';
+      desc.textContent = spec.description;
+
+      const table = document.createElement('table');
+      table.className = 'kv-table';
+      table.style.marginTop = '10px';
+      for (const [k, v] of airframeStats(spec)) {
+        const tr = document.createElement('tr');
+        const tdk = document.createElement('td');
+        tdk.className = 'k';
+        tdk.style.width = '86px';
+        tdk.textContent = k;
+        const tdv = document.createElement('td');
+        tdv.className = 'v';
+        tdv.textContent = v;
+        tr.append(tdk, tdv);
+        table.append(tr);
+      }
+
+      card.append(thumb, name, desc, table);
+      card.addEventListener('click', () => {
+        // Loading the profile also rewrites rates and tilt, which the settings
+        // sliders then edit — the same way a flight controller loads a craft.
+        settings.loadAirframeProfile(spec.id);
+        this.deps.onSettingsChanged?.();
+        this.render();
+      });
+      grid.append(card);
+    }
+    return grid;
+  }
+
+  /* ---------------------------------------------------------------------- *
+   * Controller setup / calibration
+   * ---------------------------------------------------------------------- */
+
+  /**
+   * Guided stick calibration.
+   *
+   * The default axis mapping is only reliable when the browser reports
+   * `mapping: "standard"`. Everything else — a Logitech pad in DirectInput
+   * mode, most RC transmitters — puts the sticks wherever its driver feels
+   * like, so the only dependable way to bind them is to watch what actually
+   * moves. Each step sweeps one control and takes the axis that travelled
+   * furthest, recording the raw value at both ends.
+   */
+  _renderCalibration(panel) {
+    const input = this.deps.input;
+    const st = input.getStatus();
+
+    const h1 = document.createElement('h1');
+    h1.textContent = 'CONTROLLER SETUP';
+    panel.append(h1);
+
+    const tag = document.createElement('p');
+    tag.className = 'tagline';
+    tag.textContent = st.gamepadConnected
+      ? `${st.gamepadName} — ${st.axisCount} axes, ${st.buttonCount} buttons`
+      : 'No controller detected';
+    panel.append(tag);
+
+    if (!st.gamepadConnected) {
+      const p0 = document.createElement('p');
+      p0.className = 'hint';
+      p0.innerHTML =
+        'Plug the controller in and <strong>press a button or move a stick</strong> — ' +
+        'browsers hide gamepads until they see input, so nothing shows up until you do.';
+      panel.append(p0);
+      panel.append(this._calibrationButtons());
+      return;
+    }
+
+    if (!st.standardMapping) {
+      const warn = document.createElement('p');
+      warn.className = 'hint';
+      warn.style.color = 'var(--warn)';
+      warn.textContent =
+        'This controller does not use the browser\'s standard layout, so the ' +
+        'default axis assignments are a guess. Calibrating is recommended.';
+      panel.append(warn);
+    }
+
+    /* ---- live axis monitor ---- */
+    panel.append(heading('Live axes'));
+    const mon = document.createElement('div');
+    mon.id = 'cal-monitor';
+    panel.append(mon);
+
+    /* ---- calibration steps ---- */
+    panel.append(heading('Calibrate sticks'));
+
+    const stepWrap = document.createElement('div');
+    stepWrap.id = 'cal-steps';
+    panel.append(stepWrap);
+
+    for (const key of CALIBRATABLE_AXES) {
+      const row = document.createElement('div');
+      row.className = 'remap-row';
+
+      const fn = document.createElement('div');
+      fn.className = 'fn';
+      fn.textContent = cap(key);
+
+      const bd = document.createElement('div');
+      bd.className = 'bd';
+      bd.dataset.calKey = key;
+
+      const btn = button(input.calibrating === key ? 'Done' : 'Calibrate', {
+        small: true,
+        primary: input.calibrating === key,
+        onClick: () => {
+          if (input.calibrating === key) {
+            const res = input.commitAxisCalibration();
+            if (!res.ok) this.deps.onNotice?.('warn', res.reason);
+            else this.deps.onNotice?.('info', `${cap(key)} bound to axis ${res.binding.index}.`);
+          } else {
+            input.beginAxisCalibration(key);
+          }
+          this.render();
+        },
+      });
+
+      row.append(fn, bd, btn);
+      stepWrap.append(row);
+    }
+
+    const instr = document.createElement('p');
+    instr.className = 'hint';
+    instr.id = 'cal-instruction';
+    instr.style.minHeight = '2.4em';
+    panel.append(instr);
+
+    panel.append(this._calibrationButtons());
+    this._paintCalibration();
+  }
+
+  _calibrationButtons() {
+    const row = document.createElement('div');
+    row.className = 'btn-row';
+    row.append(
+      button('Back to settings', { onClick: () => this.open('settings') }),
+      button('Reset to defaults', {
+        ghost: true,
+        onClick: () => {
+          this.deps.input.cancelAxisCalibration();
+          settings.set('gamepadMapping', defaultGamepadMapping());
+          this.deps.onNotice?.('info', 'Controller mapping reset to the standard layout.');
+          this.render();
+        },
+      }),
+    );
+    return row;
+  }
+
+  /** Repaint the live axis bars and the current step's instruction. */
+  _paintCalibration() {
+    if (this.page !== 'calibrate' || !this.isOpen) return;
+    const input = this.deps.input;
+    const axes = input.rawGamepad.axes;
+
+    const mon = this.root.querySelector('#cal-monitor');
+    if (mon) {
+      const progress = input.getCalibrationProgress();
+      const map = settings.get('gamepadMapping');
+      const owner = {};
+      for (const k of CALIBRATABLE_AXES) {
+        const b = map[k];
+        if (b && b.type === 'axis') owner[b.index] = k;
+      }
+
+      mon.innerHTML = '';
+      for (let i = 0; i < axes.length; i++) {
+        const line = document.createElement('div');
+        line.className = 'axis-line';
+
+        const nm = document.createElement('span');
+        nm.className = 'nm';
+        nm.textContent = `AX${i}`;
+
+        const bar = document.createElement('span');
+        bar.className = 'bar';
+        const fill = document.createElement('i');
+        const v = axes[i] || 0;
+        // Centre-anchored bar: neutral sits in the middle.
+        fill.style.left = `${Math.min(50, 50 + v * 50)}%`;
+        fill.style.width = `${Math.abs(v) * 50}%`;
+        if (progress && progress.bestIndex === i) fill.style.background = 'var(--warn)';
+        bar.append(fill);
+
+        const nv = document.createElement('span');
+        nv.className = 'nv';
+        nv.textContent = v.toFixed(2);
+
+        const tagEl = document.createElement('span');
+        tagEl.className = 'nm';
+        tagEl.style.flex = '0 0 62px';
+        tagEl.style.textAlign = 'right';
+        tagEl.textContent = owner[i] ? cap(owner[i]) : '';
+
+        line.append(nm, bar, nv, tagEl);
+        mon.append(line);
+      }
+    }
+
+    // Current binding text per function.
+    const map = settings.get('gamepadMapping');
+    for (const key of CALIBRATABLE_AXES) {
+      const el = this.root.querySelector(`[data-cal-key="${key}"]`);
+      if (!el) continue;
+      if (input.calibrating === key) {
+        const pr = input.getCalibrationProgress();
+        el.textContent = pr && pr.bestIndex >= 0
+          ? `listening… axis ${pr.bestIndex} (${pr.bestRange.toFixed(2)} travel)${pr.ready ? ' ✓' : ''}`
+          : 'listening… move the stick';
+        el.parentElement.classList.add('listening');
+      } else {
+        const b = map[key];
+        const { lo, hi } = b && b.type === 'axis' ? axisEndpoints(b) : { lo: 0, hi: 0 };
+        el.textContent = b && b.type === 'axis'
+          ? `axis ${b.index}  [${lo.toFixed(2)} → ${hi.toFixed(2)}]`
+          : 'unbound';
+        el.parentElement.classList.remove('listening');
+      }
+    }
+
+    const instr = this.root.querySelector('#cal-instruction');
+    if (instr) {
+      instr.textContent = input.calibrating
+        ? `${CALIBRATION_STEPS[input.calibrating]}  Then press Done.`
+        : 'Press Calibrate next to a control, sweep that stick to both extremes, ' +
+          'and finish holding the positive direction. Repeat for all four.';
+    }
+  }
+
+  /** Run a light repaint loop only while the calibration page is visible. */
+  _syncCalibrationTimer() {
+    const wants = this.isOpen && this.page === 'calibrate';
+    if (wants && !this._calTimer) {
+      this._calTimer = setInterval(() => {
+        try { this._paintCalibration(); } catch (_e) { /* never break the menu */ }
+      }, 80);
+    } else if (!wants && this._calTimer) {
+      clearInterval(this._calTimer);
+      this._calTimer = null;
+    }
   }
 
   _inputStatusLine() {
@@ -297,11 +583,24 @@ export class MainMenu {
     const gpRow = document.createElement('div');
     gpRow.className = 'btn-row';
     gpRow.style.marginTop = '8px';
-    gpRow.append(button('Controller diagnostics & remap', {
+    gpRow.append(button('Controller setup', {
+      primary: true, small: true,
+      onClick: () => this.open('calibrate'),
+    }));
+    gpRow.append(button('Diagnostics & remap', {
       small: true,
       onClick: () => this.deps.onOpenDiagnostics?.(),
     }));
     panel.append(gpRow);
+
+    const gpHint = document.createElement('p');
+    gpHint.className = 'hint';
+    gpHint.textContent =
+      'Sticks not doing anything while the buttons work? Your controller reports ' +
+      'them on different axes than the default mapping expects — run Controller ' +
+      'setup and calibrate. (On a Logitech F310, the D/X switch on the back also ' +
+      'changes the layout; X is the one browsers understand natively.)';
+    panel.append(gpHint);
 
     /* ---- rates ---- */
     panel.append(heading('Rates & sensitivity'));

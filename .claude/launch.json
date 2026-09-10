@@ -4,7 +4,12 @@
     {
       "name": "fpv-sim",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "fpv-sim", "run", "dev"],
+      "runtimeArgs": [
+        "--prefix",
+        "fpv-sim",
+        "run",
+        "dev"
+      ],
       "port": 5173
     }
   ]

@@ -40,6 +40,23 @@ const KEY_THROTTLE_RATE = 0.85; // units per second
 const ACTIVITY_THRESHOLD = 0.22;
 const REMAP_THRESHOLD = 0.55;
 
+/** A calibration sweep must cover at least this much travel to be believable. */
+const CALIBRATION_MIN_RANGE = 0.55;
+
+/**
+ * How far an *unmapped* axis must swing before we conclude the controller's
+ * sticks are not where the default mapping expects them.
+ *
+ * This is the Logitech F310 problem. The pad has a D/X switch on the back: in
+ * XInput mode Chrome reports `mapping: "standard"` and the sticks really are on
+ * axes 0-3, but in DirectInput mode the layout is driver-defined and the sticks
+ * commonly land on higher axes. The buttons still line up, so the symptom is
+ * "every button works and no stick does" — which looks like the sim ignoring
+ * the controller rather than a mapping problem.
+ */
+const STRAY_AXIS_THRESHOLD = 0.5;
+const MAPPED_AXIS_THRESHOLD = 0.35;
+
 /** Flight keys we swallow so the page never scrolls underneath the sim. */
 const CAPTURED_CODES = new Set([
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
@@ -81,9 +98,22 @@ export class InputManager {
     this._gp = { throttle: 0, pitch: 0, roll: 0, yaw: 0 };
     this._gpActiveAt = 0;
     this._gpBaseline = null;        // axis snapshot taken on connect
+    /** Per-axis peak deviation from rest, used to spot a wrong axis layout. */
+    this._axisTravel = [];
+    this._warnedStrayAxes = false;
     this._gpPrevButtons = [];       // for edge detection
     this._gpSpringThrottle = 0;     // integrated throttle in spring mode
     this.rawGamepad = { axes: [], buttons: [], connected: false, id: '' };
+
+    /* ---- RC link emulation ---- */
+    this._linkQ = [];               // {t, thr, pitch, roll, yaw} queue, oldest first
+    this.linkHeld = false;          // true this frame: a dropped packet was held over
+    this.linkFailsafe = false;      // true while the hold has run long enough to ramp to neutral
+    this.linkLatencyMs = 12;
+    this.linkLossPct = 0;
+    this._holdMs = 0;
+    this._lastDelivered = null;     // last frame actually applied to this.controls
+    this._linkClockMs = 0;          // simulated clock driven by dt, not wall time
 
     /* ---- source arbitration ---- */
     this.activeSource = 'keyboard'; // 'keyboard' | 'gamepad'
@@ -94,6 +124,12 @@ export class InputManager {
     /* ---- remap state ---- */
     this.remapTarget = null;        // e.g. 'roll' while listening
     this.onRemapComplete = null;
+
+    /* ---- guided calibration ---- */
+    this.calibrating = null;        // 'throttle' | 'yaw' | 'pitch' | 'roll'
+    this._calSamples = [];          // per-axis { min, max, last }
+    this._calRest = [];             // axis values when the step started
+    this._springWatch = null;       // resolves springThrottle after calibration
 
     /* ---- misc ---- */
     this.uiMode = false;            // true while a menu owns the keyboard
@@ -280,6 +316,11 @@ export class InputManager {
     this.controls.roll = 0;
     this.controls.yaw = 0;
     this._actions.clear();
+    this._linkQ.length = 0;
+    this._lastDelivered = null;
+    this._holdMs = 0;
+    this.linkHeld = false;
+    this.linkFailsafe = false;
   }
 
   /** Ramp a digital key pair toward its target, simulating stick travel. */
@@ -355,6 +396,9 @@ export class InputManager {
     this.gamepadName = '';
     this._gpBaseline = null;
     this._gpPrevButtons = [];
+    this._axisTravel = [];
+    this._warnedStrayAxes = false;
+    this.calibrating = null;
     this._gp.throttle = 0;
     this._gp.pitch = 0;
     this._gp.roll = 0;
@@ -402,7 +446,21 @@ export class InputManager {
     }
   }
 
-  /** Read one axis defensively. Returns 0 for a missing or garbage axis. */
+  /**
+   * Read one axis defensively. Returns 0 for a missing or garbage axis.
+   *
+   * A binding describes the raw axis value at each end of the pilot's intended
+   * travel: `lo` is whatever the hardware reports at minimum output and `hi` at
+   * maximum. Everything is a linear map between them, so one code path covers
+   * a self-centring gamepad stick (lo -1, hi +1), an inverted one (lo +1,
+   * hi -1), and an RC transmitter throttle that rests at -1 and only ever
+   * travels one way.
+   *
+   * Storing the endpoints rather than an `invert` flag is what lets guided
+   * calibration work: it records exactly what the hardware reported at each
+   * extreme, so a partial-range or off-centre pot still maps to full output.
+   * Legacy `invert`-style bindings are still accepted and converted here.
+   */
   _readAxis(pad, binding) {
     if (!binding || binding.type !== 'axis') return 0;
     const axes = pad.axes;
@@ -411,14 +469,16 @@ export class InputManager {
     let v = axes[binding.index];
     if (!Number.isFinite(v)) return 0;          // NaN / Infinity from a driver
     v = clamp(v, -1, 1);                        // some devices overshoot ±1
-    if (binding.invert) v = -v;
 
-    if (binding.mode === 'unipolar') {
-      // A centre-resting ±1 axis becomes an absolute 0..1 throttle. Up on the
-      // stick reads -1, so (1 - v) / 2 puts full-up at 1 and full-down at 0.
-      return clamp((1 - v) / 2, 0, 1);
-    }
-    return v;
+    const { lo, hi } = axisEndpoints(binding);
+    const span = hi - lo;
+    if (Math.abs(span) < 1e-3) return 0;        // degenerate calibration
+
+    // 0 at the `lo` end, 1 at the `hi` end.
+    const t = clamp((v - lo) / span, 0, 1);
+
+    // Throttle is absolute 0..1; the rotational axes are bipolar.
+    return binding.mode === 'unipolar' ? t : t * 2 - 1;
   }
 
   /** Read one button defensively across the several shapes drivers report. */
@@ -481,6 +541,10 @@ export class InputManager {
 
     this.rawGamepad.connected = true;
     this.rawGamepad.id = this.gamepadName;
+    // "standard" means the browser vouches for the axis/button layout. Anything
+    // else (a Logitech pad switched to DirectInput, most RC transmitters) is
+    // driver-defined and may put the sticks anywhere.
+    this.gamepadMapping = pad.mapping || '';
     this.rawGamepad.axes = axes.map((a) => (Number.isFinite(a) ? clamp(a, -1, 1) : 0));
     this.rawGamepad.buttons = buttons;
 
@@ -490,6 +554,20 @@ export class InputManager {
     // pilot activity, which would otherwise steal control from the keyboard.
     if (!this._gpBaseline || this._gpBaseline.length !== this.rawGamepad.axes.length) {
       this._gpBaseline = this.rawGamepad.axes.slice();
+    }
+
+    // Track how far each axis has ever travelled from rest. This is what
+    // makes a wrong layout detectable without asking the pilot anything.
+    for (let i = 0; i < this.rawGamepad.axes.length; i++) {
+      const dev = Math.abs(this.rawGamepad.axes[i] - (this._gpBaseline[i] ?? 0));
+      if (!(this._axisTravel[i] >= dev)) this._axisTravel[i] = dev;
+    }
+
+    // --- calibration capture -------------------------------------------
+    if (this.calibrating) {
+      this._sampleCalibration();
+      this._gp.throttle = 0; this._gp.pitch = 0; this._gp.roll = 0; this._gp.yaw = 0;
+      return;
     }
 
     // --- remap capture ------------------------------------------------
@@ -502,10 +580,18 @@ export class InputManager {
 
     // --- axes ---------------------------------------------------------
     const map = settings.get('gamepadMapping');
-    const rawThrottle = this._readAxis(pad, map.throttle);
-    this._gp.pitch = this._readAxis(pad, map.pitch);
-    this._gp.roll = this._readAxis(pad, map.roll);
-    this._gp.yaw = this._readAxis(pad, map.yaw);
+    // Reproduce real gimbal quantization: cheap 10-bit ADC steps plus a hair
+    // of LSB noise. Applied to a private copy so calibration/remap (which
+    // read `pad`/`rawGamepad` directly) still see the true hardware value.
+    const qAxes = this.rawGamepad.axes.map((v) => {
+      const q = Math.round(v * 512) / 512;
+      return clamp(q + (Math.random() - 0.5) * 0.004, -1, 1);
+    });
+    const qPad = { axes: qAxes };
+    const rawThrottle = this._readAxis(qPad, map.throttle);
+    this._gp.pitch = this._readAxis(qPad, map.pitch);
+    this._gp.roll = this._readAxis(qPad, map.roll);
+    this._gp.yaw = this._readAxis(qPad, map.yaw);
 
     if (settings.get('springThrottle')) {
       // Spring-centred pads (Xbox/PlayStation) rest at 50% throttle, which
@@ -536,9 +622,59 @@ export class InputManager {
     }
     if (active) this._gpActiveAt = now();
 
+    // --- post-calibration spring detection -----------------------------
+    this._updateSpringWatch();
+
+    // --- wrong-layout detection ----------------------------------------
+    this._checkStrayAxes(map);
+
     // --- button edges -> actions ---------------------------------------
     this._gamepadActionEdges(pad, map, buttons);
     this._gpPrevButtons = buttons.map((b) => b.pressed);
+  }
+
+  /**
+   * Notice when the pilot is clearly moving sticks that the current mapping
+   * does not read, and say so once.
+   *
+   * Without this the failure is completely silent: buttons respond, the HUD
+   * says a controller is connected, and the quad simply ignores every stick.
+   */
+  _checkStrayAxes(map) {
+    if (this._warnedStrayAxes) return;
+
+    const mapped = new Set(
+      CALIBRATABLE_AXES
+        .map((k) => map[k])
+        .filter((b) => b && b.type === 'axis')
+        .map((b) => b.index),
+    );
+
+    // Is any *unmapped* axis being swung about?
+    let strayMoved = false;
+    for (let i = 0; i < this._axisTravel.length; i++) {
+      if (mapped.has(i)) continue;
+      if ((this._axisTravel[i] || 0) > STRAY_AXIS_THRESHOLD) { strayMoved = true; break; }
+    }
+    if (!strayMoved) return;
+
+    // ...while some flight control's own axis has never moved at all. Checking
+    // per-function rather than "all four are dead" matters because a wrong
+    // layout usually still overlaps on an axis or two, and the pilot is left
+    // with two working controls and no explanation for the others.
+    const dead = CALIBRATABLE_AXES.filter((k) => {
+      const b = map[k];
+      if (!b || b.type !== 'axis') return false;
+      return (this._axisTravel[b.index] || 0) < MAPPED_AXIS_THRESHOLD;
+    });
+    if (dead.length === 0) return;
+
+    this._warnedStrayAxes = true;
+    this._emitDevice(
+      'danger',
+      `No stick movement reaching ${dead.join(', ')} — your controller uses a ` +
+      'different axis layout. Open Settings > Controller setup and run Calibrate sticks.',
+    );
   }
 
   _gamepadActionEdges(pad, map, buttons) {
@@ -557,6 +693,151 @@ export class InputManager {
     edge('camera', ACTIONS.CAMERA);
     edge('turtle', ACTIONS.TURTLE);
     edge('pause', ACTIONS.PAUSE);
+  }
+
+  /* ---------------------------------------------------------------------- *
+   * Guided calibration
+   * ----------------------------------------------------------------------
+   * Per-function rather than all-at-once: the pilot sweeps one control to both
+   * extremes and finishes holding the *positive* end (throttle up, yaw right,
+   * pitch forward, roll right). We watch every axis, take the one that moved
+   * furthest, and record the raw values at both ends.
+   *
+   * Ending on the positive end is what removes the guesswork about direction —
+   * there is no way to tell "up" from "down" on a raw axis otherwise, and
+   * guessing is how a throttle ends up backwards.
+   * ---------------------------------------------------------------------- */
+
+  /** Begin sampling for one function. */
+  beginAxisCalibration(target) {
+    if (!CALIBRATABLE_AXES.includes(target)) return false;
+    this.calibrating = target;
+    this.remapTarget = null;
+    const axes = this.rawGamepad.axes;
+    this._calRest = axes.slice();
+    this._calSamples = axes.map((v) => ({ min: v, max: v, last: v }));
+    return true;
+  }
+
+  cancelAxisCalibration() {
+    this.calibrating = null;
+    this._calSamples = [];
+  }
+
+  /** Live view of the sweep, for the wizard UI. */
+  getCalibrationProgress() {
+    if (!this.calibrating) return null;
+    let bestIndex = -1;
+    let bestRange = 0;
+    for (let i = 0; i < this._calSamples.length; i++) {
+      const sm = this._calSamples[i];
+      const range = sm.max - sm.min;
+      if (range > bestRange) { bestRange = range; bestIndex = i; }
+    }
+    return {
+      target: this.calibrating,
+      bestIndex,
+      bestRange,
+      ready: bestRange >= CALIBRATION_MIN_RANGE,
+      samples: this._calSamples.map((sm, i) => ({ index: i, ...sm, range: sm.max - sm.min })),
+    };
+  }
+
+  _sampleCalibration() {
+    const axes = this.rawGamepad.axes;
+    if (this._calSamples.length !== axes.length) {
+      this._calSamples = axes.map((v) => ({ min: v, max: v, last: v }));
+      this._calRest = axes.slice();
+    }
+    for (let i = 0; i < axes.length; i++) {
+      const v = axes[i];
+      const sm = this._calSamples[i];
+      if (v < sm.min) sm.min = v;
+      if (v > sm.max) sm.max = v;
+      sm.last = v;
+    }
+  }
+
+  /**
+   * Finish the sweep and store the binding.
+   * @returns {{ ok: boolean, binding?: object, reason?: string }}
+   */
+  commitAxisCalibration() {
+    const progress = this.getCalibrationProgress();
+    if (!progress) return { ok: false, reason: 'not calibrating' };
+    if (progress.bestIndex < 0 || !progress.ready) {
+      return { ok: false, reason: 'Not enough stick travel detected — sweep the control fully.' };
+    }
+
+    const target = this.calibrating;
+    const i = progress.bestIndex;
+    const sm = this._calSamples[i];
+
+    // The pilot finishes holding the positive end, so whichever extreme their
+    // final value sits nearer is the one that must map to maximum output.
+    const nearMax = Math.abs(sm.last - sm.max) <= Math.abs(sm.last - sm.min);
+    const lo = nearMax ? sm.min : sm.max;
+    const hi = nearMax ? sm.max : sm.min;
+
+    const mode = target === 'throttle' ? 'unipolar' : 'bipolar';
+    const binding = { type: 'axis', index: i, lo, hi, mode };
+
+    const map = { ...settings.get('gamepadMapping'), [target]: binding };
+    const patch = { gamepadMapping: map };
+
+    settings.set(patch);
+
+    if (target === 'throttle') {
+      // Watch where the stick settles once released. A self-centring gamepad
+      // stick springs back to the middle of its travel and so cannot hold a
+      // throttle setting; a ratcheted transmitter throttle stays put.
+      //
+      // Measured after the sweep rather than before it: at the start of a step
+      // the stick is usually still deflected from the previous one, which made
+      // an up-front reading report every pad as ratcheted.
+      this._springWatch = { index: i, min: sm.min, max: sm.max, until: now() + 1500 };
+    }
+
+    this.calibrating = null;
+    this._calSamples = [];
+    // The layout is now correct by construction, so retire the warning.
+    this._warnedStrayAxes = true;
+    this._axisTravel = [];
+
+    return { ok: true, binding, springThrottle: patch.springThrottle };
+  }
+
+  /**
+   * Resolve whether the just-calibrated throttle stick self-centres.
+   *
+   * Runs for a short window after calibration and settles on the first sample
+   * taken once the pilot has let go, which is why it waits for the axis to stop
+   * sitting at either extreme before deciding.
+   */
+  _updateSpringWatch() {
+    const w = this._springWatch;
+    if (!w) return;
+
+    const v = this.rawGamepad.axes[w.index];
+    if (!Number.isFinite(v)) { this._springWatch = null; return; }
+
+    const span = Math.abs(w.max - w.min) || 1;
+    const mid = (w.min + w.max) / 2;
+    const atExtreme = Math.min(Math.abs(v - w.min), Math.abs(v - w.max)) < span * 0.2;
+
+    if (atExtreme) {
+      // Still held. Keep waiting unless the window has expired, in which case
+      // a stick parked at an extreme is a ratcheted throttle.
+      if (now() > w.until) {
+        settings.set('springThrottle', false);
+        this._springWatch = null;
+      }
+      return;
+    }
+
+    const isSpring = Math.abs(v - mid) < span * 0.3;
+    settings.set('springThrottle', isSpring);
+    this._springWatch = null;
   }
 
   /* ---------------------------------------------------------------------- *
@@ -599,11 +880,12 @@ export class InputManager {
       const delta = axes[i] - base;
       if (Math.abs(delta) > REMAP_THRESHOLD) {
         const mode = target === 'throttle' ? 'unipolar' : 'bipolar';
-        // Bind the direction the pilot actually pushed as "positive". For a
-        // bipolar axis a negative push means the axis needs inverting; for a
-        // throttle, pushing up should read as more power.
-        const invert = mode === 'unipolar' ? delta < 0 : delta < 0;
-        this._commitRemap(target, { type: 'axis', index: i, invert, mode });
+        // Bind the direction the pilot actually pushed as maximum output. This
+        // assumes a full-range ±1 axis; `beginAxisCalibration` is the accurate
+        // route because it measures the real endpoints instead of assuming.
+        const lo = delta < 0 ? 1 : -1;
+        const hi = delta < 0 ? -1 : 1;
+        this._commitRemap(target, { type: 'axis', index: i, lo, hi, mode });
         return;
       }
     }
@@ -725,18 +1007,100 @@ export class InputManager {
     const isPad = this.activeSource === 'gamepad';
     const padDz = isPad ? dz : 0;
 
-    this.controls.pitch = this._shapeRotational(src.pitch, sens.pitch, padDz, ex);
-    this.controls.roll = this._shapeRotational(src.roll, sens.roll, padDz, ex);
-    this.controls.yaw = this._shapeRotational(src.yaw, sens.yaw, padDz, ex);
+    const shapedPitch = this._shapeRotational(src.pitch, sens.pitch, padDz, ex);
+    const shapedRoll = this._shapeRotational(src.roll, sens.roll, padDz, ex);
+    const shapedYaw = this._shapeRotational(src.yaw, sens.yaw, padDz, ex);
 
     // Throttle stays linear: an expo'd throttle makes hover trim unpredictable.
     let thr = Number.isFinite(src.throttle) ? clamp(src.throttle, 0, 1) : 0;
     if (isPad && !settings.get('springThrottle')) {
       thr = InputManager.deadzoneUnipolar(thr, dz);
     }
-    this.controls.throttle = clamp(thr, 0, 1);
+    thr = clamp(thr, 0, 1);
+
+    this._updateLink(dt, thr, shapedPitch, shapedRoll, shapedYaw);
 
     return this.controls;
+  }
+
+  /* ====================================================================== *
+   * RC link emulation
+   * ====================================================================== */
+
+  /**
+   * Model the radio link between the shaped stick output above and what the
+   * flight controller actually receives: fixed transport latency, packet
+   * loss with zero-order hold, and a failsafe ramp to neutral when a hold
+   * runs long enough to be a real link loss rather than one dropped packet.
+   *
+   * Writes the final `this.controls` values; `update()` never assigns them
+   * directly so every path (keyboard included — a real link delays both)
+   * goes through here.
+   */
+  _updateLink(dt, thr, pitch, roll, yaw) {
+    const latencyRaw = settings.get('rcLatencyMs');
+    const lossRaw = settings.get('rcLoss');
+    const latency = clamp(Number.isFinite(latencyRaw) ? latencyRaw : 12, 0, 60);
+    const lossPct = clamp(Number.isFinite(lossRaw) ? lossRaw : 0, 0, 5);
+    this.linkLatencyMs = latency;
+    this.linkLossPct = lossPct;
+
+    const dtMs = (Number.isFinite(dt) ? dt : 0) * 1000;
+    this._linkClockMs += dtMs;
+    const t = this._linkClockMs;
+    const frame = {
+      t,
+      thr: Number.isFinite(thr) ? thr : 0,
+      pitch: Number.isFinite(pitch) ? pitch : 0,
+      roll: Number.isFinite(roll) ? roll : 0,
+      yaw: Number.isFinite(yaw) ? yaw : 0,
+    };
+
+    this._linkQ.push(frame);
+    if (this._linkQ.length > 120) this._linkQ.shift();
+
+    // Pop every frame old enough to have cleared the latency window; the
+    // newest one that clears it is what the receiver has just decoded.
+    let delivered = null;
+    while (this._linkQ.length && (t - this._linkQ[0].t) >= latency) {
+      delivered = this._linkQ.shift();
+    }
+    if (!delivered) delivered = this._lastDelivered || frame;
+
+    let lossHold = false;
+    if (lossPct > 0 && Math.random() * 100 < lossPct) {
+      // Dropped packet: repeat the last delivered frame (zero-order hold)
+      // rather than snapping to neutral, exactly like a real receiver.
+      delivered = this._lastDelivered || delivered;
+      lossHold = true;
+      this._holdMs += dtMs;
+    } else {
+      this._holdMs = 0;
+    }
+    this.linkHeld = lossHold;
+
+    let failsafe = false;
+    if (this._holdMs > 300) {
+      failsafe = true;
+      const rate = clamp(5 * (Number.isFinite(dt) ? dt : 0), 0, 1);
+      delivered = {
+        t: delivered.t,
+        thr: delivered.thr + (0 - delivered.thr) * rate,
+        pitch: delivered.pitch + (0 - delivered.pitch) * rate,
+        roll: delivered.roll + (0 - delivered.roll) * rate,
+        yaw: delivered.yaw + (0 - delivered.yaw) * rate,
+      };
+    }
+    this.linkFailsafe = failsafe;
+
+    this._lastDelivered = delivered;
+
+    const fallback = this._lastDelivered || frame;
+    this.controls.throttle = Number.isFinite(delivered.thr)
+      ? clamp(delivered.thr, 0, 1) : clamp(fallback.thr || 0, 0, 1);
+    this.controls.pitch = Number.isFinite(delivered.pitch) ? delivered.pitch : (fallback.pitch || 0);
+    this.controls.roll = Number.isFinite(delivered.roll) ? delivered.roll : (fallback.roll || 0);
+    this.controls.yaw = Number.isFinite(delivered.yaw) ? delivered.yaw : (fallback.yaw || 0);
   }
 
   /** Drain queued discrete actions. Call once per frame after `update()`. */
@@ -768,6 +1132,10 @@ export class InputManager {
       gamepadCount: this.gamepadCount,
       gamepadIndex: this.gamepadIndex,
       remapTarget: this.remapTarget,
+      calibrating: this.calibrating,
+      axisCount: this.rawGamepad.axes.length,
+      buttonCount: this.rawGamepad.buttons.length,
+      standardMapping: this.gamepadMapping === 'standard',
     };
   }
 
@@ -783,6 +1151,31 @@ export class InputManager {
  * ========================================================================== */
 
 const EMPTY_ACTIONS = new Set();
+
+export const CALIBRATABLE_AXES = ['throttle', 'yaw', 'pitch', 'roll'];
+
+/** Human-readable instruction for each calibration step. */
+export const CALIBRATION_STEPS = {
+  throttle: 'Sweep the THROTTLE stick fully down, then fully up. Finish holding it UP.',
+  yaw: 'Sweep the YAW stick fully left, then fully right. Finish holding it RIGHT.',
+  pitch: 'Sweep the PITCH stick fully back, then fully forward. Finish holding it FORWARD.',
+  roll: 'Sweep the ROLL stick fully left, then fully right. Finish holding it RIGHT.',
+};
+
+/**
+ * Endpoints for a binding, converting the legacy `invert` form on the fly.
+ *
+ * Old bindings stored a boolean and assumed a full ±1 axis; new ones store the
+ * measured raw values. Both are read through here so a stored mapping from an
+ * earlier version keeps working.
+ */
+export function axisEndpoints(binding) {
+  if (Number.isFinite(binding.lo) && Number.isFinite(binding.hi) &&
+      Math.abs(binding.hi - binding.lo) > 0.2) {
+    return { lo: binding.lo, hi: binding.hi };
+  }
+  return binding.invert ? { lo: 1, hi: -1 } : { lo: -1, hi: 1 };
+}
 
 const REMAP_KIND = {
   throttle: 'axis', yaw: 'axis', pitch: 'axis', roll: 'axis',

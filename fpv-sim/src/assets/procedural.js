@@ -589,6 +589,61 @@ export function gateStripeTexture(seed = 42, repeat = [10, 1], a = '#ffffff', b 
   }, { repeat });
 }
 
+/* ========================================================================== *
+ * PBR data maps
+ * ---------------------------------------------------------------------------
+ * Grayscale companions to the colour maps above, built from the same
+ * fractal-noise machinery so surface grain lines up under a material's
+ * albedo without a second, unrelated lighting lookup. Kept as standalone
+ * generators rather than changing what the colour generators return, so
+ * every existing caller and its texture shape stays untouched.
+ * ========================================================================== */
+
+/**
+ * Roughness data map: a fractal grain field around a mid-grey base, so worn
+ * high points and grimy low points both read under `roughnessMap` without
+ * needing per-material tuning.
+ */
+export function roughFromNoise(seed = 51, repeat = [1, 1], { size = 128, base = 0.82, contrast = 0.32 } = {}) {
+  return safeTexture(size, seed, (ctx, sz, rng) => {
+    const f = fbm(rng, 6, 4);
+    const img = ctx.createImageData(sz, sz);
+    const d = img.data;
+    for (let y = 0; y < sz; y++) {
+      for (let x = 0; x < sz; x++) {
+        const n = f(x / sz, y / sz);
+        const v = Math.min(1, Math.max(0, base + (n - 0.5) * contrast));
+        const g = Math.round(v * 255);
+        const i = (y * sz + x) * 4;
+        d[i] = g; d[i + 1] = g; d[i + 2] = g; d[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, { repeat, srgb: false });
+}
+
+/**
+ * Bump data map: a lower-frequency fractal field, distinct from the
+ * roughness pass so the two do not read as a literal copy of each other.
+ */
+export function bumpFromNoise(seed = 52, repeat = [1, 1], { size = 128, contrast = 0.55 } = {}) {
+  return safeTexture(size, seed, (ctx, sz, rng) => {
+    const f = fbm(rng, 5, 3);
+    const img = ctx.createImageData(sz, sz);
+    const d = img.data;
+    for (let y = 0; y < sz; y++) {
+      for (let x = 0; x < sz; x++) {
+        const n = f(x / sz, y / sz);
+        const v = Math.min(1, Math.max(0, 0.5 + (n - 0.5) * contrast));
+        const g = Math.round(v * 255);
+        const i = (y * sz + x) * 4;
+        d[i] = g; d[i + 1] = g; d[i + 2] = g; d[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, { repeat, srgb: false });
+}
+
 /** Dispose a texture without caring whether it exists. */
 export function disposeTexture(tex) {
   try {

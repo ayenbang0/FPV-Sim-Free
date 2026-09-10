@@ -30,6 +30,14 @@ export class AudioEngine {
     this._ambient = null;    // { source|osc, gain, filter }
     this._noiseBuffer = null;
 
+    /* ---- reverb send, built once, wet amount set per map ---- */
+    this._reverbSend = null;
+    this._reverbConvolver = null;
+
+    /* ---- listener distance/doppler, refreshed by updateListener() ---- */
+    this._distGain = 1;
+    this._doppler = 1;
+
     this._currentAmbient = null;
     this._lastCrash = 0;
   }
@@ -55,6 +63,7 @@ export class AudioEngine {
       this._master.connect(this.ctx.destination);
 
       this._noiseBuffer = this._makeNoiseBuffer();
+      this._buildReverb();
       this._buildMotor();
       this._buildWind();
 
@@ -108,6 +117,40 @@ export class AudioEngine {
     return buf;
   }
 
+  /**
+   * A single generated impulse response — 0.6 s of decaying noise — shared by
+   * motors and wind. Built once; failure (or an old browser without
+   * ConvolverNode) simply leaves `_reverbSend` null and every sound stays dry.
+   */
+  _buildReverb() {
+    try {
+      const ctx = this.ctx;
+      const len = Math.max(1, Math.floor(ctx.sampleRate * 0.6));
+      const impulse = ctx.createBuffer(2, len, ctx.sampleRate);
+      for (let ch = 0; ch < 2; ch++) {
+        const data = impulse.getChannelData(ch);
+        for (let i = 0; i < len; i++) {
+          const decay = Math.pow(1 - i / len, 2.2);
+          data[i] = (Math.random() * 2 - 1) * decay;
+        }
+      }
+      const convolver = ctx.createConvolver();
+      convolver.buffer = impulse;
+
+      const send = ctx.createGain();
+      send.gain.value = 0;
+
+      send.connect(convolver);
+      convolver.connect(this._master);
+
+      this._reverbSend = send;
+      this._reverbConvolver = convolver;
+    } catch (_e) {
+      this._reverbSend = null;
+      this._reverbConvolver = null;
+    }
+  }
+
   /* ====================================================================== *
    * Motors
    * ====================================================================== */
@@ -144,6 +187,9 @@ export class AudioEngine {
     gainB.connect(filter);
     filter.connect(gain);
     gain.connect(this._master);
+    if (this._reverbSend) {
+      try { gain.connect(this._reverbSend); } catch (_e) { /* ignore */ }
+    }
 
     oscA.start();
     oscB.start();
@@ -154,24 +200,58 @@ export class AudioEngine {
   /**
    * @param {number} load   average motor command, 0..1
    * @param {boolean} armed
+   * @param {object} [voice] per-airframe timbre: { base, span, idle }
+   *
+   * Motor pitch is a property of the aircraft, not of the throttle: a 0802
+   * motor on a 31 mm prop screams somewhere around 400 Hz where a 2207 on a 5"
+   * sits nearer 90 Hz. Passing the airframe's voice through is what stops all
+   * three sounding like the same quad.
    */
-  updateMotors(load, armed) {
+  updateMotors(load, armed, voice, motors = null) {
     if (!this.ready || !this._motor) return;
     const l = Number.isFinite(load) ? Math.min(1, Math.max(0, load)) : 0;
+    const base = Number.isFinite(voice?.base) ? voice.base : 95;
+    const span = Number.isFinite(voice?.span) ? voice.span : 420;
+    // Armed props never fully stop, so neither does the whine.
+    const idle = Number.isFinite(voice?.idle) ? voice.idle : 0.05;
+
+    // Per-motor spread — how far the four commands have drifted apart —
+    // beats the two oscillators against each other harder, which is what
+    // four motors running at slightly different RPM actually sounds like.
+    let spread = 0;
+    if (Array.isArray(motors) && motors.length) {
+      let lo = Infinity, hi = -Infinity;
+      for (const m of motors) {
+        if (!Number.isFinite(m)) continue;
+        if (m < lo) lo = m;
+        if (m > hi) hi = m;
+      }
+      if (hi >= lo) spread = hi - lo;
+    }
 
     try {
       const t = this.ctx.currentTime;
-      const target = armed ? 0.055 + l * 0.16 : 0;
+      const distGain = Number.isFinite(this._distGain) ? this._distGain : 1;
+      const target = (armed ? 0.055 + Math.max(l, idle) * 0.16 : 0) * distGain;
       // Short time constants so the whine tracks punch-outs, but not so short
       // that per-frame jitter turns into audible zipper noise.
       this._motor.gain.gain.setTargetAtTime(target, t, 0.04);
 
-      const freq = 95 + l * 420;
+      let freq = base + Math.max(l, idle) * span;
+      // ESC idle wobble: a slow low-amplitude drift seeded by how much the
+      // props still spin at zero throttle.
+      if (Number.isFinite(idle) && idle > 0) {
+        freq += Math.sin(t * 2 * Math.PI * idle * 0.13) * idle * 2;
+      }
+      const doppler = Number.isFinite(this._doppler) ? this._doppler : 1;
+      freq *= doppler;
+
       this._motor.oscA.frequency.setTargetAtTime(freq, t, 0.03);
-      this._motor.oscB.frequency.setTargetAtTime(freq * 1.507, t, 0.03);
+      const wobble = Math.sin(t * 13.7) * freq * 0.004 * spread;
+      this._motor.oscB.frequency.setTargetAtTime(freq * 1.507 + wobble, t, 0.03);
       // Opening the filter with load makes hard throttle sound brighter and
       // more strained, which is most of what sells "the motors are working".
-      this._motor.filter.frequency.setTargetAtTime(600 + l * 3200, t, 0.06);
+      this._motor.filter.frequency.setTargetAtTime(base * 6 + l * span * 7, t, 0.06);
     } catch (_e) {
       this._motor = null;   // disable this one sound, keep the rest
     }
@@ -198,6 +278,9 @@ export class AudioEngine {
     source.connect(filter);
     filter.connect(gain);
     gain.connect(this._master);
+    if (this._reverbSend) {
+      try { gain.connect(this._reverbSend); } catch (_e) { /* ignore */ }
+    }
     source.start();
 
     this._wind = { source, filter, gain };
@@ -217,6 +300,52 @@ export class AudioEngine {
     } catch (_e) {
       this._wind = null;
     }
+  }
+
+  /**
+   * Distance + Doppler, driven from the render loop with the drone and
+   * camera world positions. Missing/invalid inputs reset to "no effect"
+   * rather than throwing or freezing at a stale value.
+   */
+  updateListener(dronePos, camPos, vel) {
+    if (!this.ready) return;
+    try {
+      if (!dronePos || !camPos ||
+        !Number.isFinite(dronePos.x) || !Number.isFinite(camPos.x)) {
+        this._distGain = 1;
+        this._doppler = 1;
+        return;
+      }
+      const dx = camPos.x - dronePos.x;
+      const dy = camPos.y - dronePos.y;
+      const dz = camPos.z - dronePos.z;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      this._distGain = Number.isFinite(d) ? 1 / (1 + (d * d) / 40) : 1;
+
+      let doppler = 1;
+      if (d > 1e-3 && vel &&
+        Number.isFinite(vel.x) && Number.isFinite(vel.y) && Number.isFinite(vel.z)) {
+        const radialVel = (vel.x * dx + vel.y * dy + vel.z * dz) / d;
+        if (Number.isFinite(radialVel)) doppler = 1 - radialVel / 343;
+      }
+      this._doppler = Number.isFinite(doppler) ? Math.min(1.08, Math.max(0.92, doppler)) : 1;
+    } catch (_e) {
+      this._distGain = 1;
+      this._doppler = 1;
+    }
+  }
+
+  /**
+   * Per-map reverb wet level — a small room, an empty shed, and open field
+   * all sound different even with identical source material.
+   */
+  setEnvironment(mapId) {
+    if (!this.ready || !this._reverbSend) return;
+    const presets = { house: 0.35, warehouse: 0.25, field: 0.06 };
+    const level = Number.isFinite(presets[mapId]) ? presets[mapId] : 0.1;
+    try {
+      this._reverbSend.gain.setTargetAtTime(level, this.ctx.currentTime, 1.5);
+    } catch (_e) { /* ignore */ }
   }
 
   /* ====================================================================== *
@@ -282,6 +411,31 @@ export class AudioEngine {
       osc.start(now);
       osc.stop(now + duration + 0.02);
     } catch (_e) { /* ignore */ }
+  }
+
+  /**
+   * A prop-strike graze: a shorter, brighter version of the crash thud —
+   * reuses the same noise buffer, no new assets.
+   */
+  playStrike(intensity = 1) {
+    if (!this.ready) return;
+    const amp = Math.min(1, Math.max(0.1, Number.isFinite(intensity) ? intensity : 1));
+    try {
+      const now = this.ctx.currentTime;
+      const src = this.ctx.createBufferSource();
+      src.buffer = this._noiseBuffer;
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.value = 2800;
+      f.Q.value = 3.5;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.4 * amp, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.28 * 0.4);
+
+      src.connect(f); f.connect(g); g.connect(this._master);
+      src.start(now);
+      src.stop(now + 0.3 * 0.4);
+    } catch (_e) { /* one failed strike is not worth reporting */ }
   }
 
   /* ====================================================================== *

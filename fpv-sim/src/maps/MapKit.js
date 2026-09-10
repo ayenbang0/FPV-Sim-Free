@@ -21,7 +21,7 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { GROUP } from '../core/PhysicsWorld.js';
-import { makeRng } from '../assets/procedural.js';
+import { makeRng, roughFromNoise, bumpFromNoise } from '../assets/procedural.js';
 
 export class MapBuilder {
   /**
@@ -86,9 +86,29 @@ export class MapBuilder {
 
   /** Convenience: a standard material that tolerates a null texture map. */
   standard(key, { color = 0xffffff, map = null, roughness = 0.85, metalness = 0.0, ...rest } = {}) {
-    return this.material(key, () => new THREE.MeshStandardMaterial({
-      color, map: map || null, roughness, metalness, ...rest,
-    }));
+    return this.material(key, () => {
+      const mat = new THREE.MeshStandardMaterial({
+        color, map: map || null, roughness, metalness, ...rest,
+      });
+
+      // PBR grain: only worth the extra texture uploads on materials that
+      // already carry a procedural colour map — flat-shaded and emissive
+      // materials (gate rings, UI accents) stay cheap and untouched. A
+      // generation failure falls back to the flat-shaded material.
+      if (map) {
+        try {
+          const seed = hashKey(key);
+          const rep = [map.repeat?.x || 1, map.repeat?.y || 1];
+          const rough = this.tex(roughFromNoise(seed, rep));
+          const bump = this.tex(bumpFromNoise(seed + 1, rep));
+          if (rough) mat.roughnessMap = rough;
+          if (bump) { mat.bumpMap = bump; mat.bumpScale = 0.02; }
+        } catch (_e) {
+          /* no PBR grain; the flat-shaded material still looks correct */
+        }
+      }
+      return mat;
+    });
   }
 
   /* ====================================================================== *
@@ -402,6 +422,63 @@ export class MapBuilder {
     };
   }
 
+  /**
+   * Build a whole course from an ordered list of gate positions, deriving each
+   * gate's heading from the racing line rather than hand-picking angles.
+   *
+   * Hand-authored headings are extremely easy to get wrong: a gate rotated even
+   * 60 degrees off the line of travel is one the pilot flies *alongside* rather
+   * than through, and because the pass test is a plane crossing, such a gate can
+   * be almost impossible to trigger. Orienting each ring to bisect its incoming
+   * and outgoing legs makes every gate face the pilot by construction.
+   *
+   * @param {Array<{x:number,y:number,z:number,r?:number}>} points ordered gates
+   * @param {{spawn?:{x:number,z:number}, radius?:number, tube?:number}} opts
+   */
+  course(points, { spawn = null, radius = 1.4, tube = 0.09 } = {}) {
+    const n = points.length;
+    if (n === 0) return [];
+
+    return points.map((pt, i) => {
+      const prev = i > 0 ? points[i - 1] : (spawn ? { x: spawn.x, z: spawn.z } : pt);
+      const next = i < n - 1 ? points[i + 1] : null;
+
+      // Incoming leg, and the outgoing leg where one exists.
+      let dx = pt.x - prev.x;
+      let dz = pt.z - prev.z;
+      let inLen = Math.hypot(dx, dz) || 1;
+      dx /= inLen; dz /= inLen;
+
+      if (next) {
+        let ox = next.x - pt.x;
+        let oz = next.z - pt.z;
+        const outLen = Math.hypot(ox, oz) || 1;
+        ox /= outLen; oz /= outLen;
+
+        // Weighted bisector, biased toward the leg the pilot arrives on. An
+        // even 50/50 bisect turns a 90-degree corner gate 45 degrees away from
+        // the approach, which is nearly edge-on and very hard to read at speed;
+        // 65/35 keeps it under 30 degrees while still leading into the exit.
+        dx = dx * 0.65 + ox * 0.35;
+        dz = dz * 0.65 + oz * 0.35;
+        const bl = Math.hypot(dx, dz);
+        if (bl > 1e-4) { dx /= bl; dz /= bl; }
+      }
+
+      // atan2(x, z) is the yaw that carries local +Z onto (dx, dz), and the
+      // torus's axis is its local +Z — so this points the ring down the line.
+      const rotationY = Math.atan2(dx, dz);
+
+      return this.gate({
+        position: [pt.x, pt.y, pt.z],
+        rotationY,
+        radius: pt.r ?? radius,
+        tube,
+        index: i,
+      });
+    });
+  }
+
   /* ====================================================================== *
    * Lighting helpers
    * ====================================================================== */
@@ -443,6 +520,16 @@ export class MapBuilder {
     for (const b of this._bodies) physics.removeBody(b);
     this._bodies.length = 0;
   }
+}
+
+/** Deterministic small-int seed from a material cache key, for PBR grain. */
+function hashKey(str) {
+  let h = 0;
+  const s = String(str);
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0) || 1;
 }
 
 function safeDispose(resource) {

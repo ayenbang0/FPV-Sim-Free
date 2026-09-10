@@ -31,8 +31,12 @@ export const CAMERA_MODES = ['fpv', 'chase', 'cinematic'];
 
 const MODE_LABELS = { fpv: 'FPV', chase: 'CHASE', cinematic: 'CINEMATIC' };
 
-/** Where the camera sits on the frame: slightly forward of, and above, centre. */
-const MOUNT_OFFSET = new THREE.Vector3(0, 0.035, -0.03);
+/**
+ * Where the camera sits on the frame: slightly forward of, and above, centre.
+ * Scaled per airframe — a 65 mm whoop's camera is 1.6 cm up, a 5"'s is 3.5 cm,
+ * and getting this wrong makes gap judgement feel subtly off.
+ */
+const DEFAULT_MOUNT = new THREE.Vector3(0, 0.035, -0.03);
 
 export class CameraRig {
   /**
@@ -67,6 +71,10 @@ export class CameraRig {
 
     /* ---- scratch ---- */
     this._tiltQuat = new THREE.Quaternion();
+    this._mount = DEFAULT_MOUNT.clone();
+    // Chase/cinematic standoff scales with the airframe: 2.1 m frames a 5"
+    // quad nicely and makes a 75 mm whoop a speck. 1.0 = the 5" reference.
+    this._rigScale = 1;
     this._tmpQuat = new THREE.Quaternion();
     this._tmpVec = new THREE.Vector3();
 
@@ -76,7 +84,35 @@ export class CameraRig {
     this._composerFailed = false;
     this._size = { w: 1, h: 1 };
 
+    /* ---- FPV latency queue (pose history for a lagged goggle feed) ---- */
+    this._poseQ = [];
+
+    /* ---- link quality, 0..1, drives VTX breakup in the CRT shader ---- */
+    this.rssi = 1;
+
     this.applySettings();
+  }
+
+  /**
+   * Scale the third-person cameras to the airframe.
+   *
+   * `bodyWidth` is the collider's full width in metres, against a 0.20 m
+   * reference (the 5" freestyle). Clamped at the bottom so a micro does not put
+   * the camera inside its own props, and at the top so nothing drifts absurdly
+   * far out.
+   */
+  setRigScale(bodyWidth) {
+    const w = Number.isFinite(bodyWidth) && bodyWidth > 0 ? bodyWidth : 0.20;
+    this._rigScale = Math.min(1.6, Math.max(0.34, w / 0.20));
+  }
+
+  /** Adopt the active airframe's camera mount position. */
+  setMount(offset) {
+    if (Array.isArray(offset) && offset.every(Number.isFinite)) {
+      this._mount.set(offset[0], offset[1], offset[2]);
+    } else {
+      this._mount.copy(DEFAULT_MOUNT);
+    }
   }
 
   /** Sync FOV and tilt from the settings store. */
@@ -133,10 +169,11 @@ export class CameraRig {
    */
   update(dt, pos, quat, drone) {
     this.applySettings();
+    this._updateRssi(pos, drone);
 
     const step = Number.isFinite(dt) ? Math.min(Math.max(dt, 0), 0.1) : 0.016;
 
-    if (this.mode === 'fpv') this._updateFpv(step, pos, quat);
+    if (this.mode === 'fpv') this._updateFpv(step, pos, quat, drone);
     else if (this.mode === 'chase') this._updateChase(step, pos, quat);
     else this._updateCinematic(step, pos, quat);
 
@@ -148,9 +185,9 @@ export class CameraRig {
     if (!isFiniteQuaternion(this.camera.quaternion)) this.camera.quaternion.copy(quat);
   }
 
-  _updateFpv(dt, pos, quat) {
+  _updateFpv(dt, pos, quat, drone) {
     // Position: exact. Mount offset rotated into the frame's orientation.
-    this._tmpVec.copy(MOUNT_OFFSET).applyQuaternion(quat);
+    this._tmpVec.copy(this._mount).applyQuaternion(quat);
     this.camera.position.copy(pos).add(this._tmpVec);
 
     // Orientation: frame orientation plus the fixed camera uptilt...
@@ -166,13 +203,17 @@ export class CameraRig {
     this._smoothQuat.slerp(this._targetQuat, clamp01(alpha));
     if (!isFiniteQuaternion(this._smoothQuat)) this._smoothQuat.copy(this._targetQuat);
     this.camera.quaternion.copy(this._smoothQuat);
+
+    this._applyFpvLatency();
+    this._applyJello(drone);
   }
 
   _updateChase(dt, pos, quat) {
     // Sit behind and above the frame, but only follow its *heading*, not its
     // roll — a chase cam that barrel-rolls with the quad is unusable.
     const heading = headingOf(quat, this._tmpQuat);
-    this._desired.set(0, 0.55, 2.1).applyQuaternion(heading).add(pos);
+    this._desired.set(0, 0.55 * this._rigScale, 2.1 * this._rigScale)
+      .applyQuaternion(heading).add(pos);
 
     const alpha = 1 - Math.exp(-6 * dt);
     this._chasePos.lerp(this._desired, clamp01(alpha));
@@ -190,7 +231,8 @@ export class CameraRig {
     // Wider standoff, much heavier damping, and a slight lead so the quad
     // sits off-centre in frame the way a real chase shot would.
     const heading = headingOf(quat, this._tmpQuat);
-    this._desired.set(1.1, 0.85, 3.4).applyQuaternion(heading).add(pos);
+    this._desired.set(1.1 * this._rigScale, 0.85 * this._rigScale, 3.4 * this._rigScale)
+      .applyQuaternion(heading).add(pos);
 
     const alpha = 1 - Math.exp(-1.8 * dt);
     this._chasePos.lerp(this._desired, clamp01(alpha));
@@ -230,6 +272,83 @@ export class CameraRig {
     this.camera.quaternion.multiply(this._shakeQuat);
   }
 
+  /**
+   * Analog FPV latency: the camera's transform is held on a short queue and
+   * replayed a fixed delay behind the frame, the way a real camera → VTX →
+   * goggle chain does. Zero setting means zero behaviour change.
+   */
+  _applyFpvLatency() {
+    const raw = settings.get('fpvLatency');
+    const latency = Number.isFinite(raw) ? Math.min(60, Math.max(0, raw)) : 28;
+
+    const q = this._poseQ;
+    try {
+      q.push({ p: this.camera.position.clone(), q: this.camera.quaternion.clone(), t: performance.now() });
+    } catch (_e) { return; }
+    while (q.length > 8) q.shift();
+
+    if (latency <= 0) return;
+
+    const now = performance.now();
+    let chosen = null;
+    for (let i = q.length - 1; i >= 0; i--) {
+      if (now - q[i].t >= latency) { chosen = q[i]; break; }
+    }
+    if (chosen) {
+      this.camera.position.copy(chosen.p);
+      this.camera.quaternion.copy(chosen.q);
+    }
+  }
+
+  /**
+   * Rolling-shutter jello: a horizontal skew proportional to the current
+   * body rate, exactly like a CMOS sensor reading out while the frame spins.
+   */
+  _applyJello(drone) {
+    let rate = 0;
+    try {
+      rate = (drone && drone.body && drone.body.angularVelocity)
+        ? drone.body.angularVelocity.length()
+        : 0;
+    } catch (_e) { rate = 0; }
+    if (!Number.isFinite(rate)) rate = 0;
+    const shear = Math.min(0.004, Math.max(0, rate * 0.00012));
+
+    try {
+      const w = this._size.w;
+      const h = this._size.h;
+      if (shear > 1e-5 && w > 0 && h > 0) {
+        this.camera.setViewOffset(w, h, shear * w, 0, w, h);
+      } else if (this.camera.view && this.camera.view.enabled) {
+        this.camera.clearViewOffset();
+      }
+    } catch (_e) { /* some render targets do not support view offsets */ }
+  }
+
+  /**
+   * Link quality feeding the VTX-breakup shader: falls off with distance
+   * from the spawn point (a stand-in for the pilot's antenna), with a little
+   * multipath flicker indoors. Missing drone/spawn data is full signal.
+   */
+  _updateRssi(pos, drone) {
+    try {
+      const spawn = drone?.spawnPoint;
+      let d = 0;
+      if (spawn && isFiniteVector(pos)) d = pos.distanceTo(spawn);
+      if (!Number.isFinite(d)) d = 0;
+
+      let r = 1 / (1 + (d * d) / 800);
+
+      const mapId = settings.get('map');
+      if (mapId === 'house' || mapId === 'warehouse') {
+        r -= Math.abs(Math.sin(performance.now() * 0.001 * 37)) * 0.05;
+      }
+      this.rssi = clamp01(r);
+    } catch (_e) {
+      this.rssi = 1;
+    }
+  }
+
   /** Snap the smoothed state to the frame — used after a respawn. */
   reset(pos, quat) {
     this._targetQuat.copy(quat).multiply(this._tiltQuat);
@@ -239,6 +358,9 @@ export class CameraRig {
     this._chasePos.copy(pos).add(new THREE.Vector3(0, 0.6, 2.2));
     this._lookTarget.copy(pos);
     this._shakeTime = 0;
+    this._poseQ.length = 0;
+    this.rssi = 1;
+    try { this.camera.clearViewOffset(); } catch (_e) { /* ignore */ }
   }
 
   /* ====================================================================== *
@@ -274,7 +396,16 @@ export class CameraRig {
       if (!this._composer) this._buildComposer();
       if (this._composer) {
         try {
-          if (this._crtPass) this._crtPass.uniforms.uTime.value = performance.now() * 0.001;
+          if (this._crtPass) {
+            this._crtPass.uniforms.uTime.value = performance.now() * 0.001;
+
+            const fov = Number.isFinite(this.camera.fov) ? this.camera.fov : 130;
+            this._crtPass.uniforms.uLens.value = 0.08 + (fov - 90) * 0.0015;
+
+            const breakupSetting = settings.get('vtxBreakup');
+            const breakupOn = typeof breakupSetting === 'boolean' ? breakupSetting : true;
+            this._crtPass.uniforms.uRssi.value = breakupOn ? clamp01(this.rssi) : 1;
+          }
           this._composer.render();
           return;
         } catch (err) {
@@ -342,6 +473,8 @@ const CRT_SHADER = {
     tDiffuse: { value: null },
     uTime: { value: 0 },
     uResolution: { value: new THREE.Vector2(1, 1) },
+    uLens: { value: 0.12 },
+    uRssi: { value: 1 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -354,6 +487,8 @@ const CRT_SHADER = {
     uniform sampler2D tDiffuse;
     uniform float uTime;
     uniform vec2 uResolution;
+    uniform float uLens;
+    uniform float uRssi;
     varying vec2 vUv;
 
     float hash(vec2 p) {
@@ -364,6 +499,16 @@ const CRT_SHADER = {
       vec2 uv = vUv;
       vec2 centered = uv - 0.5;
       float r2 = dot(centered, centered);
+
+      // Barrel distortion: a cheap lens, worse at wider FOV.
+      uv += centered * r2 * uLens;
+
+      float rssi = clamp(uRssi, 0.0, 1.0);
+      // VTX signal loss: a horizontal tear that grows as link quality drops.
+      if (rssi < 0.35) {
+        float tear = step(0.9, fract(uv.y * 3.0 + uTime)) * 0.02 * (0.35 - rssi);
+        uv.x += tear;
+      }
 
       // Chromatic aberration: zero at the centre, growing toward the corners,
       // which is how a cheap lens and an analog link both actually fail.
@@ -380,6 +525,12 @@ const CRT_SHADER = {
       // Signal noise, strongest where the picture is darkest.
       float n = hash(uv * uResolution.xy * 0.5 + uTime * 60.0);
       col += (n - 0.5) * 0.045 * (1.2 - dot(col, vec3(0.333)));
+
+      // VTX breakup: extra luma noise and desaturation as RSSI drops.
+      float breakupN = hash(uv * uResolution.xy * 0.37 + uTime * 91.0);
+      col += (1.0 - rssi) * (breakupN - 0.5) * 0.35;
+      float luma = dot(col, vec3(0.299, 0.587, 0.114));
+      col = mix(col, vec3(luma), (1.0 - rssi) * 0.6);
 
       // Vignette.
       col *= smoothstep(0.92, 0.22, r2);

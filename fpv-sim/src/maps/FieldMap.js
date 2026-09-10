@@ -66,8 +66,14 @@ export class FieldMap {
     // Spawn in the clearing just outside the barn, facing down the field.
     const sx = -26;
     const sz = 34;
-    this.spawnPoint = new THREE.Vector3(sx, terrainHeight(sx, sz) + 1.1, sz);
-    this.spawnHeading = Math.PI;   // face -Z... rotated 180° to look up-field
+    // Sat in the grass. The extra 6 cm over the collider's resting height
+    // absorbs the small difference between the analytic terrain and the
+    // heightfield's piecewise-linear approximation of it.
+    this.spawnPoint = new THREE.Vector3(sx, terrainHeight(sx, sz) + 0.18, sz);
+    // Heading 0 keeps local -Z pointing down-field, which puts gate 1 (at
+    // z = 6, ~28 m ahead) directly in front of the pilot on spawn. The barn
+    // sits behind-left as a landmark.
+    this.spawnHeading = 0;
 
     this.groundLevel = 0;
     this.gates = [];
@@ -81,6 +87,10 @@ export class FieldMap {
     this._prevFog = null;
     this._prevBackground = null;
     this._water = null;
+    this._dust = null;
+    this._dustVel = null;
+    this._dustPhase = 0;
+    this._dustHalf = null;
   }
 
   /** AGL reference used by the HUD altimeter. */
@@ -117,6 +127,7 @@ export class FieldMap {
 
     yield { progress: 0.84, label: 'Power lines' };
     this._buildPowerLines(b);
+    this._buildDust(b);
 
     yield { progress: 0.90, label: 'Scatter' };
     yield* this._buildScatter(b);
@@ -625,6 +636,53 @@ export class FieldMap {
     }
   }
 
+  /**
+   * Dust/haze motes: a light additive cloud drifting low over the playable
+   * core of the field (not the full 500 m extent — that would spread 1200
+   * points too thin to read). Seated a few metres above the rolling terrain
+   * so it never clips into a hillside.
+   */
+  _buildDust(b) {
+    const COUNT = 1200;
+    const HALF = 140;
+    const positions = new Float32Array(COUNT * 3);
+    const vel = new Float32Array(COUNT * 3);
+
+    for (let i = 0; i < COUNT; i++) {
+      const x = rnd(b, -HALF, HALF);
+      const z = rnd(b, -HALF, HALF);
+      const ground = terrainHeight(x, z);
+      const base = Number.isFinite(ground) ? ground : 0;
+      positions[i * 3] = x;
+      positions[i * 3 + 1] = base + rnd(b, 0.3, 9);
+      positions[i * 3 + 2] = z;
+      vel[i * 3] = rnd(b, -0.12, 0.12);
+      vel[i * 3 + 1] = rnd(b, -0.03, 0.05);
+      vel[i * 3 + 2] = rnd(b, -0.12, 0.12);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    b._looseGeometries.add(geo);
+
+    const mat = b.material('dust', () => new THREE.PointsMaterial({
+      color: 0xe8e0c8,
+      size: 0.05,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.5,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: true,
+    }));
+
+    this._dust = new THREE.Points(geo, mat);
+    this._dust.frustumCulled = false;
+    b.root.add(this._dust);
+    this._dustVel = vel;
+    this._dustHalf = HALF;
+  }
+
   /* ---------------------------------------------------------------------- *
    * Scatter: rocks, bushes, ramps, tracks
    * ---------------------------------------------------------------------- */
@@ -720,23 +778,28 @@ export class FieldMap {
    * ---------------------------------------------------------------------- */
 
   _buildGates(b) {
-    // A long, fast circuit that uses the barn, the pond, and the power lines.
+    // A long, fast circuit that loops around the pond and back past the barn.
+    // Headings are derived from the racing line by `course()`.
     const layout = [
-      { x: -26, z: 6, ry: 0, r: 2.6 },
-      { x: 6, z: -34, ry: Math.PI * 0.25, r: 2.6 },
-      { x: 62, z: -52, ry: Math.PI * 0.5, r: 2.4 },
-      { x: 104, z: 4, ry: Math.PI * 0.72, r: 2.6 },
-      { x: 46, z: 58, ry: Math.PI, r: 2.6 },
-      { x: -18, z: 74, ry: Math.PI * 1.25, r: 2.6 },
+      { x: -26, z: 6, r: 2.6 },
+      { x: 6, z: -34, r: 2.6 },
+      { x: 62, z: -52, r: 2.4 },
+      { x: 104, z: 4, r: 2.6 },
+      { x: 46, z: 58, r: 2.6 },
+      { x: -18, z: 74, r: 2.6 },
     ];
 
-    this.gates = layout.map((g, i) => b.gate({
-      position: [g.x, terrainHeight(g.x, g.z) + g.r + 1.4, g.z],
-      rotationY: g.ry,
-      radius: g.r,
-      tube: 0.12,
-      index: i,
+    const points = layout.map((g) => ({
+      x: g.x,
+      y: terrainHeight(g.x, g.z) + g.r + 1.4,
+      z: g.z,
+      r: g.r,
     }));
+
+    this.gates = b.course(points, {
+      spawn: { x: this.spawnPoint.x, z: this.spawnPoint.z },
+      tube: 0.12,
+    });
   }
 
   /* ====================================================================== *
@@ -753,11 +816,74 @@ export class FieldMap {
     }
   }
 
+  /**
+   * Dust kick-up: points within 2 m of the drone get pushed away and up,
+   * scaled by average motor load and inverse-square distance. Everything
+   * else drifts on its ambient velocity, wrapping back inside the dust
+   * volume at the edges. Called by the main loop each frame; args are
+   * optional and guarded so a missing drone reference or a bad dt just
+   * falls back to ambient drift.
+   */
+  updatePropwash(dronePos, avgMotor, dt) {
+    if (!this._dust || !this._dustVel) return;
+    const dtc = Number.isFinite(dt) && dt > 0 ? Math.min(dt, 0.1) : 0;
+    if (dtc <= 0) return;
+    this._dustPhase = (Number.isFinite(this._dustPhase) ? this._dustPhase : 0) + dtc;
+    const t = this._dustPhase;
+    const half = Number.isFinite(this._dustHalf) ? this._dustHalf : 140;
+
+    const pos = this._dust.geometry.attributes.position;
+    const arr = pos.array;
+    const v = this._dustVel;
+    const motor = Number.isFinite(avgMotor) ? Math.max(0, Math.min(1, avgMotor)) : 0;
+    const dx0 = dronePos && Number.isFinite(dronePos.x) ? dronePos.x : null;
+    const dy0 = dronePos && Number.isFinite(dronePos.y) ? dronePos.y : null;
+    const dz0 = dronePos && Number.isFinite(dronePos.z) ? dronePos.z : null;
+    const hasDrone = dx0 !== null && dy0 !== null && dz0 !== null;
+
+    for (let i = 0; i < arr.length; i += 3) {
+      let px = arr[i], py = arr[i + 1], pz = arr[i + 2];
+
+      if (hasDrone && motor > 0.02) {
+        const ddx = px - dx0, ddy = py - dy0, ddz = pz - dz0;
+        const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (d2 < 4) {
+          const d = Math.sqrt(d2) || 0.001;
+          const kick = (motor / (1 + d2)) * dtc * 3;
+          px += (ddx / d) * kick;
+          py += ((ddy / d) * 0.5 + 0.7) * kick;
+          pz += (ddz / d) * kick;
+        }
+      }
+
+      px += v[i] * dtc + Math.sin(t * 0.6 + i) * 0.01 * dtc;
+      py += v[i + 1] * dtc;
+      pz += v[i + 2] * dtc + Math.cos(t * 0.5 + i) * 0.01 * dtc;
+
+      if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) {
+        px = (Math.random() - 0.5) * half;
+        py = 5 + Math.random() * 4;
+        pz = (Math.random() - 0.5) * half;
+      }
+
+      if (px < -half) px = half; else if (px > half) px = -half;
+      if (py < 0.2) py = 9; else if (py > 12) py = 0.3;
+      if (pz < -half) pz = half; else if (pz > half) pz = -half;
+
+      arr[i] = px; arr[i + 1] = py; arr[i + 2] = pz;
+    }
+    pos.needsUpdate = true;
+  }
+
   dispose(scene, physics) {
     if (this.builder) this.builder.dispose(scene, physics);
     this.builder = null;
     this.gates = [];
     this._water = null;
+    this._dust = null;
+    this._dustVel = null;
+    this._dustPhase = 0;
+    this._dustHalf = null;
     scene.background = this._prevBackground ?? null;
     scene.fog = this._prevFog ?? null;
   }

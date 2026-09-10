@@ -104,6 +104,8 @@ class Simulator {
     this._prevGatePos = new THREE.Vector3();
     this._scratchA = new THREE.Vector3();
     this._scratchB = new THREE.Vector3();
+    this._envLights = null;
+    this._envBase = null;
 
     this._loop = this._loop.bind(this);
   }
@@ -134,7 +136,7 @@ class Simulator {
 
     this.scene = new THREE.Scene();
     this.physics = new PhysicsWorld({ fixedTimeStep: this.fixedDt });
-    this.drone = new DroneController(this.physics);
+    this.drone = new DroneController(this.physics, settings.get('droneType'));
     this.drone.body.isDrone = true;                 // MapManager keeps this body
     this.scene.add(this.drone.object3d);
 
@@ -234,6 +236,7 @@ class Simulator {
       onStart: (id) => this.startFlight(id),
       onOpenDiagnostics: () => this.diagnostics.setOpen(true),
       onSettingsChanged: () => this._applySettings(),
+      onNotice: (level, message) => this.toast(level, message),
     });
 
     this.pauseMenu = new PauseMenu(this.dom.menuRoot, {
@@ -241,6 +244,7 @@ class Simulator {
       onResume: () => this.resume(),
       onRestart: () => { this.resume(); this.respawn({ full: true }); },
       onChangeMap: () => this._openMainMenu('main'),
+      onControllerSetup: () => this._openMainMenu('calibrate'),
       onDiagnostics: () => { this.resume(); this.diagnostics.setOpen(true); },
       onSettings: () => this._openMainMenu('settings', 'pause'),
       onMainMenu: () => this._openMainMenu('main'),
@@ -260,16 +264,34 @@ class Simulator {
   }
 
   _wireCallbacks() {
-    this.input.onDeviceEvent = (level, message) => this.toast(level, message);
+    this.input.onDeviceEvent = (level, message) => {
+      this.toast(level, message);
+
+      // A wrong axis layout is not something a toast can fix — the pilot has to
+      // rebind. If they are not mid-flight, take them straight to the screen
+      // that does it rather than leaving them to find it.
+      if (level === 'danger' && /calibrat/i.test(message) && this.state !== 'flying') {
+        this._openMainMenu('calibrate');
+      }
+    };
 
     this.mapManager.onProgress = (p, label) => this._setLoadingProgress(p, label);
     this.mapManager.onNotice = (level, message) => this.toast(level, message);
 
-    this.drone.onCrash = (impact) => {
+    this.drone.onCrash = (impact, severity) => {
+      const sev = severity || 'destroyed';
       this.stats.crashes++;
-      this._flashCrash();
-      this.audio.playCrash(impact);
-      this.toast('danger', 'Crashed — press R to respawn.');
+      this._flashCrash(sev);
+      try {
+        if (sev === 'destroyed') {
+          this.audio.playCrash(impact);
+        } else {
+          this.audio.playStrike?.(Math.min(1, impact / 8));
+        }
+      } catch (_e) { /* a failed crash sound must not break the frame */ }
+      if (sev !== 'graze') {
+        this.toast('danger', sev === 'hard' ? 'Hard knock — shake it off.' : 'Crashed — press R to respawn.');
+      }
     };
 
     this.drone.onArmChange = (armed) => {
@@ -277,8 +299,11 @@ class Simulator {
     };
 
     this.drone.onBatteryState = (stage) => {
-      if (stage === 'low') this.toast('warn', 'Low battery — 14.8 V.');
-      else if (stage === 'critical') this.toast('danger', 'Land now — 14.0 V.');
+      // Thresholds are per-pack: 3.5 V is a flat 1S and a dead-short 4S, so the
+      // message has to quote the airframe's own numbers rather than the 4S ones.
+      const b = this.drone.spec.battery;
+      if (stage === 'low') this.toast('warn', `Low battery — ${b.LOW.toFixed(1)} V (${b.label}).`);
+      else if (stage === 'critical') this.toast('danger', `Land now — ${b.CRITICAL.toFixed(1)} V (${b.label}).`);
       else if (stage === 'cutoff') this.toast('danger', 'Battery cutoff. Press R for a fresh pack.');
     };
 
@@ -362,6 +387,9 @@ class Simulator {
 
     this.audio.init();
     this.audio.setAmbient(mapId);
+    try { this.audio.setEnvironment?.(mapId); } catch (_e) { /* ignore */ }
+    this._captureEnvironmentLights();
+    this._applyEnvironmentLighting();
     this.mainMenu.setSelectedMap(mapId);
 
     const meta = this.mapManager.getMeta(mapId);
@@ -624,15 +652,43 @@ class Simulator {
     this.camera.update(renderDt, this._interpPos, this._interpQuat, this.drone);
     this.mapManager.update(renderDt, this.elapsed);
 
-    this.audio.updateMotors(this.drone.avgMotor, this.drone.armed);
-    this.audio.updateWind(this.drone.telemetry.speed);
+    // Dust/propwash kick-up: skip when adaptive quality has already bottomed
+    // out the pixel ratio and frames are still slow — a struggling machine
+    // should not also pay for particle physics.
+    const map = this.mapManager.current;
+    const dustStarved = settings.get('adaptiveQuality') && this._pixelRatio <= 0.75 &&
+      this.fps > 0 && this.fps < 45;
+    if (map && !dustStarved && typeof map.updatePropwash === 'function') {
+      try {
+        map.updatePropwash(this._interpPos, this.drone.avgMotor, renderDt);
+      } catch (_e) { /* a failed propwash update must not take the frame down */ }
+    }
 
+    this.audio.updateMotors(this.drone.avgMotor, this.drone.armed, this.drone.spec.audio, this.drone.motors);
+    this.audio.updateWind(this.drone.telemetry.speed);
+    try {
+      const camPos = this.camera.camera?.position;
+      const vel = this.drone.body?.velocity;
+      if (camPos && vel) {
+        this.audio.updateListener?.(this._interpPos, camPos, { x: vel.x, y: vel.y, z: vel.z });
+      }
+    } catch (_e) { /* ignore */ }
+
+    const windSpeedRaw = settings.get('windSpeed');
     this.hud.update({
       drone: this.drone,
       input: this.input.getStatus(),
       cameraLabel: this.camera.modeLabel,
       mapName: this.mapManager.getMeta(this.mapManager.currentId)?.displayName ?? '',
       race: this.race,
+      armed: this.drone.armed,
+      flightMode: settings.get('flightMode'),
+      batteryStage: this.drone.getBatteryStage(),
+      rssi: this.camera?.rssi,
+      damage: this.drone?.damage ?? 0,
+      windSpeed: Number.isFinite(windSpeedRaw) ? windSpeedRaw : 2.5,
+      linkHeld: this.input?.linkHeld,
+      failsafe: this.input?.linkFailsafe,
     });
 
     this.camera.render();
@@ -824,6 +880,37 @@ class Simulator {
   }
 
   /* ====================================================================== *
+   * Airframe
+   * ====================================================================== */
+
+  /**
+   * Switch to a different airframe.
+   *
+   * Rebuilding the body changes its mass, collider and arm geometry, so the
+   * quad is respawned rather than left wherever the old one was — a 23 g whoop
+   * inheriting a race quad's 50 m/s velocity is not a state worth supporting.
+   * Idempotent, so `_applySettings()` can call it on every settings change.
+   */
+  setDroneType(typeId) {
+    if (!this.drone) return false;
+    if (this.drone.spec.id === typeId) return false;
+
+    const changed = this.drone.setAirframe(typeId);
+    if (!changed) return false;
+
+    // The new mesh is a new object; re-add it and re-apply the FPV visibility
+    // rule, or the chase camera ends up looking at nothing.
+    if (this.drone.object3d.parent !== this.scene) this.scene.add(this.drone.object3d);
+    this.drone.object3d.visible = this.camera.showsDroneBody;
+
+    this.physics.protect(this.drone.body);
+
+    this.respawn({ silent: true });
+    this.toast('info', `${this.drone.spec.displayName} — ${this.drone.spec.className}`);
+    return true;
+  }
+
+  /* ====================================================================== *
    * Presentation helpers
    * ====================================================================== */
 
@@ -834,6 +921,14 @@ class Simulator {
       this.audio.applySettings();
       this.hud.setVisible(settings.get('hudVisible'));
       this.drone.windEnabled = this.mapManager.currentId === 'field' && settings.get('wind');
+      this.setDroneType(settings.get('droneType'));
+
+      // Unconditional: setDroneType returns early when the craft is unchanged,
+      // so the airframe the app booted with would otherwise never get its
+      // camera mount or third-person standoff applied.
+      this.camera.setMount(this.drone.spec.cameraMount);
+      this.camera.setRigScale(this.drone.spec.body[0]);
+      this._applyEnvironmentLighting();
     } catch (err) {
       console.warn('[main] failed to apply settings', err);
     }
@@ -860,15 +955,108 @@ class Simulator {
     if (this.dom.loadingSub) this.dom.loadingSub.textContent = label || ' ';
   }
 
-  _flashCrash() {
+  _flashCrash(severity = 'destroyed') {
+    if (severity === 'graze') return;
     const el = this.dom.crashFlash;
     if (!el) return;
+    el.style.background = severity === 'hard' ? 'var(--warn)' : 'var(--danger)';
     el.style.transition = 'none';
-    el.style.opacity = '0.42';
+    el.style.opacity = severity === 'hard' ? '0.28' : '0.42';
     // Force a reflow so the transition restarts from the new value.
     void el.offsetWidth;
     el.style.transition = 'opacity 420ms ease-out';
     el.style.opacity = '0';
+  }
+
+  /**
+   * Locate the hemisphere + directional lights the current map's builder
+   * added to the scene, and snapshot their authored intensities/colours so
+   * the sun-angle/overcast sliders have a stable baseline to scale from
+   * instead of drifting further from the map's own art direction every time
+   * a setting changes. Missing lights degrade to a no-op, never a throw.
+   */
+  _captureEnvironmentLights() {
+    this._envLights = null;
+    this._envBase = null;
+    try {
+      const hemis = [];
+      const dirs = [];
+      this.scene.traverse((obj) => {
+        if (obj.isHemisphereLight) hemis.push(obj);
+        else if (obj.isDirectionalLight) dirs.push(obj);
+      });
+      dirs.sort((a, b) => b.intensity - a.intensity);
+
+      const hemi = hemis[0] || null;
+      const sun = dirs[0] || null;
+      const fill = dirs[1] || null;
+      if (!hemi && !sun && !fill) return;
+
+      this._envLights = { hemi, sun, fill };
+      this._envBase = {
+        hemiI: hemi ? hemi.intensity : 0,
+        hemiSky: hemi ? hemi.color.clone() : null,
+        hemiGround: hemi ? hemi.groundColor.clone() : null,
+        sunI: sun ? sun.intensity : 0,
+        sunColor: sun ? sun.color.clone() : null,
+        fillI: fill ? fill.intensity : 0,
+        fogNear: this.scene.fog ? this.scene.fog.near : null,
+        fogFar: this.scene.fog ? this.scene.fog.far : null,
+      };
+    } catch (_e) {
+      this._envLights = null;
+      this._envBase = null;
+    }
+  }
+
+  /** Drive the captured lights + fog from the `sunAngle`/`overcast` settings. */
+  _applyEnvironmentLighting() {
+    const base = this._envBase;
+    if (!base) return;
+    try {
+      const { hemi, sun, fill } = this._envLights || {};
+
+      const rawAngle = settings.get('sunAngle');
+      const sunAngle = Number.isFinite(rawAngle) ? Math.min(1, Math.max(0, rawAngle)) : 0.5;
+      const rawOvercast = settings.get('overcast');
+      const overcast = Number.isFinite(rawOvercast) ? Math.min(1, Math.max(0, rawOvercast)) : 0;
+
+      // 0 or 1 = grazing dawn/dusk light, 0.5 = overhead noon.
+      const sunFactor = 0.35 + 0.65 * Math.sin(sunAngle * Math.PI);
+
+      if (sun && Number.isFinite(base.sunI)) {
+        sun.intensity = base.sunI * sunFactor * (1 - overcast * 0.7);
+        if (base.sunColor) {
+          const warm = this._scratchColor || (this._scratchColor = new THREE.Color());
+          warm.set(0xffc78c);
+          sun.color.copy(base.sunColor);
+          sun.color.lerp(warm, (1 - Math.sin(sunAngle * Math.PI)) * (1 - overcast * 0.5));
+          if (overcast > 0) sun.color.lerp(this._scratchColorB || (this._scratchColorB = new THREE.Color(0xffffff)), overcast * 0.4);
+        }
+      }
+      if (fill && Number.isFinite(base.fillI)) {
+        fill.intensity = base.fillI * (1 - overcast * 0.35);
+      }
+      if (hemi && Number.isFinite(base.hemiI)) {
+        hemi.intensity = base.hemiI * (0.7 + 0.3 * sunFactor) * (1 - overcast * 0.15);
+        if (base.hemiSky && base.hemiGround) {
+          if (overcast > 0) {
+            const grey = this._scratchColorC || (this._scratchColorC = new THREE.Color());
+            grey.copy(base.hemiSky).lerp(base.hemiGround, 0.5);
+            hemi.color.copy(base.hemiSky).lerp(grey, overcast);
+            hemi.groundColor.copy(base.hemiGround).lerp(grey, overcast);
+          } else {
+            hemi.color.copy(base.hemiSky);
+            hemi.groundColor.copy(base.hemiGround);
+          }
+        }
+      }
+      if (this.scene.fog && Number.isFinite(base.fogNear) && Number.isFinite(base.fogFar)) {
+        const shrink = 1 - overcast * 0.55;
+        this.scene.fog.near = Math.max(1, base.fogNear * shrink);
+        this.scene.fog.far = Math.max(this.scene.fog.near + 1, base.fogFar * shrink);
+      }
+    } catch (_e) { /* guard missing lights */ }
   }
 
   toast(level, message) {

@@ -322,10 +322,25 @@ function nowMs() {
     : Date.now();
 }
 
+/**
+ * Yield to the browser for one frame.
+ *
+ * Races requestAnimationFrame against a timer, because a backgrounded or
+ * hidden tab stops firing rAF completely. Without the fallback, a map load
+ * that is in progress when the user switches away never finishes — and never
+ * finishes when they come back either, because `loading` stays true and the
+ * promise it is waiting on is already dead.
+ */
 function nextFrame() {
   return new Promise((resolve) => {
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => resolve());
-    else setTimeout(resolve, 16);
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(finish);
+    setTimeout(finish, 32);
   });
 }
 
