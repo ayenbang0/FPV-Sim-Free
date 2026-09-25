@@ -64,17 +64,20 @@ import { ControllerDiagnostics } from './ui/ControllerDiagnostics.js';
 const MAX_FRAME_DT = 0.25;     // hard clamp on a single frame's delta
 
 /**
- * Simulation rates offered, fastest first for the auto-downgrade walk.
- *
- * A real flight controller closes its rate loop in the kilohertz, and control
- * feel is dominated by how fresh the loop's view of the world is. 240 Hz is the
- * default because it halves the control latency of a 120 Hz loop (4.2 ms vs
- * 8.3 ms) at a cost that is invisible on any machine that can render the maps
- * at all. The PID tune is rate-independent (see D_CUTOFF_HZ in
- * DroneController), so changing this does not change how the quad flies —
- * only how finely it is resolved.
+ * Simulation / flight-controller loop rates offered, fastest first for the
+ * auto-downgrade walk. The Betaflight port runs its PID loop at this rate, as
+ * a real FC does (BF's default is 8 kHz gyro / 4 kHz PID; 1 kHz is the
+ * sim's default and 500 Hz the adaptive floor).
  */
-const SIM_RATES = [960, 480, 240, 120];
+const SIM_RATES = [2000, 1000, 500];
+
+/**
+ * Time-trial layout id for best times: MultiGP-spec gates are a different
+ * course, so their records are kept apart (`:mgp`).
+ */
+export function raceLayoutId(mapId) {
+  return settings.get('gateSpec') === 'multigp' ? `${mapId}:mgp` : mapId;
+}
 
 /** Substep cap, scaled so the ceiling is a ~40 ms frame at any rate. */
 function substepCap(rate) {
@@ -350,7 +353,7 @@ class Simulator {
   /** Best times are keyed per course layout, so a rebuilt course starts clean. */
   _courseKey(mapId = this.mapManager.currentId) {
     const meta = this.mapManager.getMeta(mapId);
-    return meta?.courseKey || mapId;
+    return raceLayoutId(meta?.courseKey || mapId);
   }
 
   _buildUi() {
@@ -360,6 +363,7 @@ class Simulator {
     this.mainMenu = new MainMenu(this.dom.menuRoot, {
       maps: this.mapManager.available,
       input: this.input,
+      onToast: (level, msg) => this.toast(level, msg),
       onStart: (id) => this.startFlight(id),
       onOpenDiagnostics: () => this.diagnostics.setOpen(true),
       onSettingsChanged: () => this._applySettings(),
@@ -664,6 +668,25 @@ class Simulator {
     // quad, far more than it can travel in one frame's worth of substeps.
     this.mapManager.updateColliders(this.drone.body.position);
 
+    // RX frames carry wall-clock stamps; map this render frame's wall span
+    // onto the substeps about to run (substep k of n covers wallStart + k·h),
+    // so the FC sees the link's real frame timing on the sim clock.
+    const ctl = this.input.controls;
+    ctl.switchArming = !!ctl.switchArming;
+    this.input.armIndicator = this.drone.armed;
+    const planned = Math.min(this.maxSubsteps, Math.floor(this._accumulator / h + 1e-9));
+    const simStart = this.drone.simTime;
+    const wallA = this.input.prevFrameWall;
+    const wallB = this.input.frameWall;
+    let lastT = Math.max(this.drone._lastQueuedT, simStart - 1);
+    for (const f of ctl.rxFrames) {
+      const u = wallB > wallA ? Math.min(1, Math.max(0, (f.tw - wallA) / (wallB - wallA))) : 1;
+      let t = simStart + u * planned * h;
+      if (!(t > lastT)) t = lastT + 1e-6;
+      f.t = t;
+      lastT = t;
+    }
+
     // Guard 2: cap substeps. If the machine cannot keep up we let the sim run
     // slow rather than spiralling, and drop the backlog so it recovers.
     let steps = 0;
@@ -803,7 +826,7 @@ class Simulator {
     }
   }
 
-  /** Drop to the next slower simulation rate, never below the 120 Hz floor. */
+  /** Drop to the next slower simulation rate, never below the 500 Hz floor. */
   _stepDownSimRate() {
     const i = SIM_RATES.indexOf(this.simRate);
     const next = SIM_RATES[i + 1];
@@ -826,6 +849,14 @@ class Simulator {
 
   /** Book-keeping that only needs to happen once per rendered frame. */
   _postPhysics() {
+    // BEEPER mode: a 4 Hz blip while the switch is on.
+    if (this.drone.fc.beeper) {
+      const t = performance.now();
+      if (!(t - (this._beepAt || 0) < 250)) {
+        this._beepAt = t;
+        this.audio.playBlip(2200, 0.08, 0.12);
+      }
+    }
     const t = this.drone.telemetry;
     if (t.speed > this.stats.topSpeed) this.stats.topSpeed = t.speed;
     if (t.altitude > this.stats.maxAltitude) this.stats.maxAltitude = t.altitude;
@@ -878,7 +909,9 @@ class Simulator {
       } catch (_e) { /* a failed propwash update must not take the frame down */ }
     }
 
-    this.audio.updateMotors(this.drone.avgMotor, this.drone.armed, this.drone.spec.audio, this.drone.motors);
+    const rpm = this.drone.motorRPM;
+    const motorLoad = ((rpm[0] + rpm[1] + rpm[2] + rpm[3]) / 4) / this.drone.motorRpmMax;
+    this.audio.updateMotors(Number.isFinite(motorLoad) ? motorLoad : 0, this.drone.armed, this.drone.spec.audio, this.drone.motors);
     this.audio.updateWind(this.drone.telemetry.speed);
     try {
       const camPos = this.camera.camera?.position;
@@ -897,7 +930,10 @@ class Simulator {
       mapName: this.mapManager.getMeta(this.mapManager.currentId)?.displayName ?? '',
       race: this.race,
       armed: this.drone.armed,
-      flightMode: settings.get('flightMode'),
+      flightMode: this.drone.flightModeActive,
+      armBlockReason: this.drone.armBlockReason,
+      switchArming: this.input.controls.switchArming,
+      lq: this.input.controls.lq,
       batteryStage: this.drone.getBatteryStage(),
       rssi: this.camera?.rssi,
       damage: this.drone?.damage ?? 0,
@@ -961,6 +997,13 @@ class Simulator {
             this.toast('warn', 'Battery is flat — press R for a fresh pack.');
             break;
           }
+          if (this.input.controls.switchArming) {
+            if (!this._armSwitchToastShown) {
+              this._armSwitchToastShown = true;
+              this.toast('info', 'Arm with your ARM switch');
+            }
+            break;
+          }
           this.drone.toggleArmed();
           break;
 
@@ -999,7 +1042,7 @@ class Simulator {
           if (this.state !== 'flying') break;
           if (this.drone.isInverted()) {
             this.drone.requestTurtle();
-            this.toast('info', 'Turtle mode — righting the quad.');
+            this.toast('info', 'Crash flip — push roll or pitch to flip it over.');
           }
           break;
 
@@ -1159,6 +1202,16 @@ class Simulator {
         this._applyQualityTier(false);
       }
       this.setDroneType(settings.get('droneType'));
+      // Betaflight settings changed → rebuild gains and filters.
+      const tuneKey = JSON.stringify([
+        settings.get('fcRates'), settings.get('fcPid'), settings.get('fcFilters'), settings.get('fcMisc'),
+        settings.get('modes'), settings.get('rcDeadband'), settings.get('inputMode'), settings.get('serialProtocol'),
+        this.drone.spec.id,
+      ]);
+      if (tuneKey !== this._tuneKey) {
+        this._tuneKey = tuneKey;
+        this.drone.applyTune();
+      }
 
       // Unconditional: setDroneType returns early when the craft is unchanged,
       // so the airframe the app booted with would otherwise never get its

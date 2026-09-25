@@ -37,6 +37,9 @@ define('navigator', { getGamepads: () => [pad] });
 define('window', { addEventListener() {}, removeEventListener() {} });
 define('document', { addEventListener() {}, removeEventListener() {}, visibilityState: 'visible' });
 
+// Link latency is emulated on wall-clock stamps; these checks tick faster
+// than real time, so run the link with zero latency.
+settings.set('rcLatencyMs', 0);
 const inp = new InputManager();
 const tick = (n = 3) => { for (let i = 0; i < n; i++) inp.update(1 / 60); };
 
@@ -100,7 +103,7 @@ check('pitch calibrates onto axis 5', rp.ok && rp.binding.index === 5,
 
 // --- now fly it ---
 settings.set('springThrottle', false);   // test absolute throttle mapping
-settings.set('deadzone', 0.08);
+settings.set('rcDeadband', 10);
 pad.axes = [0, 0, 1, -1, 1, -1];   // yaw right, throttle up, roll right, pitch fwd
 tick(4);
 const c = inp.controls;
@@ -132,6 +135,50 @@ check('partial-range pot still reaches full output', c.roll > 0.95, `roll=${c.ro
 const legacy = axisEndpoints({ type: 'axis', index: 1, invert: true, mode: 'unipolar' });
 check('legacy invert binding converts to endpoints', legacy.lo === 1 && legacy.hi === -1,
   `lo=${legacy.lo} hi=${legacy.hi}`);
+
+// --- EdgeTX / OpenTX radio preset (USB joystick, AETR) ---
+{
+  settings.loadRadioPreset('edgetx');
+  settings.set('inputMode', 'gamepad');
+  const radio = {
+    index: 0, connected: true, mapping: '', id: 'EdgeTX Radio Joystick',
+    axes: [0, 0, -1, 0, 1, -1, 0, 0],
+    buttons: Array.from({ length: 8 }, () => ({ pressed: false, value: 0 })),
+  };
+  define('navigator', { getGamepads: () => [radio] });
+  const rin = new InputManager();
+  for (let i = 0; i < 4; i++) rin.update(1 / 60);
+  const ch = rin.controls.channels;
+  check('EdgeTX preset: roll 1500, throttle 1000, AUX1 2000',
+    Math.abs(ch[0] - 1500) < 3 && Math.abs(ch[2] - 1000) < 3 && Math.abs(ch[4] - 2000) < 3,
+    `roll=${ch[0].toFixed(0)} thr=${ch[2].toFixed(0)} aux1=${ch[4].toFixed(0)}`);
+  check('EdgeTX preset: switch-based arming', rin.controls.switchArming === true);
+
+  // ARM evaluates true once throttle is low and AUX1 was seen off first.
+  const { FlightController } = await import('../src/fc/FlightController.js');
+  const fc = new FlightController({ modes: settings.get('modes') }, 1000);
+  fc.setArmSource('switch');
+  let t = 0;
+  const feed = (aux1, n) => {
+    for (let i = 0; i < n; i++) {
+      t += 0.001;
+      if (i % 4 === 0) {
+        radio.axes[4] = aux1;
+        rin.update(1 / 250);
+        fc.onRxFrame(rin.controls.channels, t);
+      }
+      fc.update(0.001, { trueRatesDps: [0, 0, 0], attitudeDeg: { rollDeg: 0, pitchDeg: 0 }, motorRpm: [0, 0, 0, 0], vbat: 25, t });
+    }
+  };
+  feed(1, 40);
+  const blockedFirst = !fc.armed && fc.armBlockReason === 'ARMSWITCH';
+  feed(-1, 40);
+  feed(1, 40);
+  check('EdgeTX preset: ARM only after the switch was seen off', blockedFirst && fc.armed,
+    `first=${blockedFirst} armed=${fc.armed} reason=${fc.armBlockReason}`);
+  settings.loadRadioPreset('gamepad');
+  settings.set('inputMode', 'auto');
+}
 
 console.log(`\n${pass}/${pass + fail} input checks passed`);
 if (fail) process.exit(1);

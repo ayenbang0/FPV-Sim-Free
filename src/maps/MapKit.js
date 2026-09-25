@@ -27,6 +27,7 @@
  * API is identical either way.
  */
 
+import { settings } from '../core/Settings.js';
 import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
@@ -538,8 +539,13 @@ export class MapBuilder {
     if (style === 'square' || style === 'dive') {
       shape = 'square';
       const dive = style === 'dive';
-      const w = width ?? radius * 2;
-      const h = dive ? w : (height ?? w);
+      let w = width ?? radius * 2;
+      let h = dive ? w : (height ?? w);
+      if (settings.get('gateSpec') === 'multigp') {
+        // MultiGP spec: 5 ft (1.524 m) square gates, 10 × 5 ft hurdles.
+        // Position and rotation stay as authored, so openings shrink in place.
+        if (!dive && w >= 1.5 * h) { w = 3.048; h = 1.524; } else { w = 1.524; h = 1.524; }
+      }
       halfW = w / 2;
       halfH = h / 2;
       const t = Math.max(0.1, Math.min(0.28, w * 0.075));   // bar thickness

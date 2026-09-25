@@ -4,61 +4,82 @@
  * Flight-data recorder in the Betaflight Blackbox mould: a bounded ring
  * buffer of per-substep loop data, exportable as CSV.
  *
- * The controller pushes one row per physics substep (guarded by the
+ * The controller pushes one row per flight-controller loop (guarded by the
  * `blackbox` settings flag at the call site, so this module costs nothing
- * when recording is off). The buffer holds 30 s at 240 Hz (7200 rows);
- * older rows are dropped. `downloadCsv()` emits a Blob download whose
- * column order matches the Betaflight blackbox CSV export header, so the
- * file opens in any spreadsheet or log viewer.
+ * when recording is off). The buffer holds 30 s at 1 kHz (30000 rows); older
+ * rows are dropped. `downloadCsv()` emits a Blob download whose columns
+ * follow Betaflight's blackbox CSV export names, with `time` in sim seconds.
  *
- * Everything here is allocation-free on push (fixed row shape, shift() on a
- * capped array) and teardown-safe (download degrades silently without DOM).
+ * Teardown-safe: download degrades silently without DOM.
  */
 
-const MAX_ROWS = 7200;   // 30 s at 240 Hz
+const MAX_ROWS = 30000;   // 30 s at 1 kHz
 
 const HEADER = [
   'loopIteration', 'time',
-  'thr', 'pitch', 'roll', 'yaw',
-  'spRoll', 'spPitch', 'spYaw',
-  'm0', 'm1', 'm2', 'm3',
-  'vbat', 'gyroR', 'gyroP', 'gyroY',
+  'rcCommand0', 'rcCommand1', 'rcCommand2', 'rcCommand3',
+  'setpoint0', 'setpoint1', 'setpoint2',
+  'gyroADC0', 'gyroADC1', 'gyroADC2',
+  'axisP0', 'axisP1', 'axisP2',
+  'axisI0', 'axisI1', 'axisI2',
+  'axisD0', 'axisD1', 'axisD2',
+  'axisF0', 'axisF1', 'axisF2',
+  'motor0', 'motor1', 'motor2', 'motor3',
+  'rpm0', 'rpm1', 'rpm2', 'rpm3',
+  'vbat', 'amperage',
 ];
 
 function num(v) {
   return Number.isFinite(v) ? v : 0;
 }
 
+const at = (a, i) => num(a ? a[i] : 0);
+
 class Blackbox {
   constructor() {
     this.rows = [];
+    this._head = 0;   // index of the oldest row once the buffer is full
     this.iteration = 0;
   }
 
-  /** Record one substep. Row shape is fixed; non-finite fields become 0. */
+  /**
+   * Record one FC loop: `{ loopIteration, time, rcCommand[4], setpoint[3],
+   * gyroADC[3], axisP/I/D/F[3], motor[4], rpm[4], vbat, amperage }`.
+   * Non-finite fields become 0.
+   */
   push(row) {
     if (!row) return;
-    this.rows.push([
-      this.iteration++,
-      num(row.t),
-      num(row.thr), num(row.pitch), num(row.roll), num(row.yaw),
-      num(row.spRoll), num(row.spPitch), num(row.spYaw),
-      num(row.m0), num(row.m1), num(row.m2), num(row.m3),
-      num(row.vbat), num(row.gyroR), num(row.gyroP), num(row.gyroY),
-    ]);
-    if (this.rows.length > MAX_ROWS) {
-      this.rows.splice(0, this.rows.length - MAX_ROWS);
+    const r = [
+      Number.isFinite(row.loopIteration) ? row.loopIteration : this.iteration,
+      num(row.time),
+    ];
+    for (let i = 0; i < 4; i++) r.push(at(row.rcCommand, i));
+    for (const k of ['setpoint', 'gyroADC', 'axisP', 'axisI', 'axisD', 'axisF']) {
+      for (let i = 0; i < 3; i++) r.push(at(row[k], i));
+    }
+    for (let i = 0; i < 4; i++) r.push(at(row.motor, i));
+    for (let i = 0; i < 4; i++) r.push(Math.round(at(row.rpm, i)));
+    r.push(num(row.vbat), num(row.amperage));
+    this.iteration++;
+    // Ring buffer: overwrite the oldest row once full (O(1) per loop).
+    if (this.rows.length < MAX_ROWS) {
+      this.rows.push(r);
+    } else {
+      this.rows[this._head] = r;
+      this._head = (this._head + 1) % MAX_ROWS;
     }
   }
 
   clear() {
     this.rows.length = 0;
+    this._head = 0;
     this.iteration = 0;
   }
 
   toCsv() {
     const lines = [HEADER.join(',')];
-    for (const r of this.rows) lines.push(r.join(','));
+    const n = this.rows.length;
+    for (let k = 0; k < n; k++) lines.push(this.rows[(this._head + k) % n].join(','));
     return lines.join('\n');
   }
 
@@ -83,4 +104,4 @@ class Blackbox {
 }
 
 export const blackbox = new Blackbox();
-export { Blackbox, MAX_ROWS };
+export { Blackbox, MAX_ROWS, HEADER };
