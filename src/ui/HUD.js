@@ -199,7 +199,7 @@ export class HUD {
     /* ---- arm / modes ---- */
     this._set(this.armState, d.armed ? 'ARMED' : 'DISARMED');
     this.armState.classList.toggle('hud-danger', !d.armed);
-    this._set(this.flightMode, `MODE: ${String(settings.get('flightMode')).toUpperCase()}`);
+    this._set(this.flightMode, `MODE: ${String(s.flightMode || settings.get('flightMode')).toUpperCase()}`);
     this._set(this.craft, `CRAFT: ${String(d.spec.displayName).toUpperCase()}`);
     this._set(this.cameraMode, `CAM: ${s.cameraLabel || 'FPV'}`);
 
@@ -211,7 +211,8 @@ export class HUD {
     let status = '';
     if (d.crashed) status = 'CRASHED<span class="sub">Press R to respawn</span>';
     else if (d.motorCutByBattery) status = 'BATTERY CUTOFF<span class="sub">Press R for a fresh pack</span>';
-    else if (!d.armed) status = 'DISARMED<span class="sub">Press SPACE to arm</span>';
+    else if (!d.armed && s.armBlockReason) status = `DISARMED<span class="sub">ARMING DISABLED: ${s.armBlockReason}</span>`;
+    else if (!d.armed) status = `DISARMED<span class="sub">${s.switchArming ? 'Flip your ARM switch' : 'Press SPACE to arm'}</span>`;
     this._setHtml(this.centerStatus, status);
 
     /* ---- OSD warnings ---- */
@@ -219,9 +220,12 @@ export class HUD {
     const armed = typeof s.armed === 'boolean' ? s.armed : d.armed;
     if (armed) tokens.push('ARMED');
     const fm = String(s.flightMode || settings.get('flightMode') || 'angle').toLowerCase();
-    if (fm === 'horizon') tokens.push('HORIZON');
+    if (fm === 'crashflip') tokens.push('TURTLE');
+    else if (fm === 'horizon') tokens.push('HORIZON');
     else if (fm === 'acro') tokens.push('ACRO');
     else tokens.push('ANGLE');
+    if (s.armBlockReason === 'RXLOSS') tokens.push('RXLOSS');
+    if (Number.isFinite(s.lq)) tokens.push(`LQ ${Math.round(s.lq)}`);
     if (s.linkHeld) tokens.push('HOLD');
     if (s.failsafe) tokens.push('FAILSAFE');
     if (stage === 'low' || stage === 'critical' || stage === 'cutoff') tokens.push('LOW BATT');

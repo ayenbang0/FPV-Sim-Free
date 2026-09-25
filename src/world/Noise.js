@@ -2,7 +2,7 @@
  * world/Noise.js
  * ---------------------------------------------------------------------------
  * Seeded coherent noise for terrain, scatter and texture generation, plus the
- * matching GLSL snippets the ground/grass/rock shaders use.
+ * matching TSL noise functions the ground/grass node materials use.
  *
  * Everything here is deterministic from a seed: a map must look identical on
  * every load, or learning a line through a forest is impossible. The CPU side
@@ -11,6 +11,7 @@
  * warped variants do not show the axis-aligned streaks value noise does.
  */
 
+import { Fn, float, vec2, vec3, dot, floor, fract, mix } from 'three/tsl';
 import { makeRng } from '../assets/procedural.js';
 
 const F2 = 0.5 * (Math.sqrt(3) - 1);
@@ -213,47 +214,45 @@ export function smoothPath(ctrl, spacing = 4) {
 }
 
 /* ========================================================================== *
- * GLSL
+ * TSL (GPU) noise
  * ========================================================================== */
 
 /**
- * Hash + value noise + fbm in GLSL. Value noise is enough on the GPU: it only
- * breaks up tiling and adds micro-variation, and it is several times cheaper
- * than simplex per fragment on integrated graphics.
+ * Hash + value noise + fbm as TSL functions, for the ground and grass node
+ * materials. Value noise is enough on the GPU: it only breaks up tiling and
+ * adds micro-variation, and it is several times cheaper than simplex per
+ * fragment on integrated graphics. Same constants as the former GLSL
+ * snippets, so the look is unchanged.
  */
-export const GLSL_NOISE = /* glsl */`
-  float fpvHash12(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
+export const fpvHash12 = /*@__PURE__*/ Fn(([p]) => {
+  const p3 = fract(vec3(p.x, p.y, p.x).mul(0.1031)).toVar();
+  p3.addAssign(dot(p3, p3.yzx.add(33.33)));
+  return fract(p3.x.add(p3.y).mul(p3.z));
+}).setLayout({ name: 'fpvHash12', type: 'float', inputs: [{ name: 'p', type: 'vec2' }] });
+
+export const fpvNoise = /*@__PURE__*/ Fn(([p]) => {
+  const i = floor(p);
+  const f = fract(p);
+  const u = f.mul(f).mul(float(3.0).sub(f.mul(2.0)));
+  const a = fpvHash12(i);
+  const b = fpvHash12(i.add(vec2(1.0, 0.0)));
+  const c = fpvHash12(i.add(vec2(0.0, 1.0)));
+  const d = fpvHash12(i.add(vec2(1.0, 1.0)));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}).setLayout({ name: 'fpvNoise', type: 'float', inputs: [{ name: 'p', type: 'vec2' }] });
+
+export const fpvFbm = /*@__PURE__*/ Fn(([pIn]) => {
+  const p = vec2(pIn).toVar();
+  const v = float(0.0).toVar();
+  let a = 0.5;
+  for (let i = 0; i < 4; i++) {
+    v.addAssign(fpvNoise(p).mul(a));
+    // mat2(0.8, -0.6, 0.6, 0.8) * p * 2.03 (GLSL matrices are column-major).
+    p.assign(vec2(p.x.mul(0.8).add(p.y.mul(0.6)), p.x.mul(-0.6).add(p.y.mul(0.8))).mul(2.03));
+    a *= 0.5;
   }
-  vec2 fpvHash22(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.xx + p3.yz) * p3.zy);
-  }
-  float fpvNoise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    float a = fpvHash12(i);
-    float b = fpvHash12(i + vec2(1.0, 0.0));
-    float c = fpvHash12(i + vec2(0.0, 1.0));
-    float d = fpvHash12(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-  }
-  float fpvFbm(vec2 p) {
-    float v = 0.0;
-    float a = 0.5;
-    mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
-    for (int i = 0; i < 4; i++) {
-      v += a * fpvNoise(p);
-      p = r * p * 2.03;
-      a *= 0.5;
-    }
-    return v;
-  }
-`;
+  return v;
+}).setLayout({ name: 'fpvFbm', type: 'float', inputs: [{ name: 'p', type: 'vec2' }] });
 
 /**
  * Distance-to-polylines on a regular grid, filled once and then sampled

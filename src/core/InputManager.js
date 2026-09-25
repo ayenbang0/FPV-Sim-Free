@@ -4,8 +4,14 @@
  * The one and only place where physical devices become flight commands.
  *
  *   Keyboard  ─┐
- *              ├─► InputManager ─► { throttle, pitch, roll, yaw } + action edges
- *   Gamepad   ─┘
+ *   Gamepad   ─┼─► InputManager ─► RC channels + timestamped RX frames + actions
+ *   Serial RX ─┘
+ *
+ * The flight controller (src/fc) receives what a real FC receives: 16 RC
+ * channels in µs (AETR order: roll, pitch, throttle, yaw, AUX1..12), as a
+ * stream of timestamped frames — keyboard at 100 Hz, gamepads sampled at
+ * 250 Hz, serial receivers at their own link rate. Stick shaping (expo,
+ * rates, deadband) is the FC's job, not this file's.
  *
  * `DroneController` reads that normalised object and has no idea what produced
  * it. That is not just tidiness: it means device data is sanitised in exactly
@@ -28,7 +34,12 @@
  *     that throw from `getGamepads()`, simply run keyboard-only.
  */
 
-import { settings } from './Settings.js';
+import { settings, AUX_KEYS } from './Settings.js';
+import { SerialRx } from '../input/SerialRx.js';
+
+const KEYBOARD_FRAME_MS = 10;        // 100 Hz keyboard "radio"
+const GAMEPAD_SAMPLE_MS = 4;         // 250 Hz pad sampling
+const SERIAL_FRESH_MS = 100;         // auto mode: serial wins while this fresh
 
 /** Time for a digital key to ramp an axis from centre to full deflection. */
 const KEY_RAMP_TIME = 0.15;   // seconds — spec section 7.2
@@ -82,7 +93,24 @@ export const ACTIONS = Object.freeze({
 export class InputManager {
   constructor() {
     /* ---- normalised output (mutated in place; never reallocated) ---- */
-    this.controls = { throttle: 0, pitch: 0, roll: 0, yaw: 0 };
+    this.controls = {
+      throttle: 0, pitch: 0, roll: 0, yaw: 0,      // normalised, for HUD / diagnostics
+      channels: new Float32Array(16).fill(1500),   // latest channels, µs, AETR
+      rxFrames: [],                                // [{ tw (wall ms), t (sim s, set by main), ch }]
+      switchArming: false,                         // true: the FC arms from the ARM switch
+      lq: NaN,                                     // CRSF link quality, when known
+    };
+    this.controls.channels[2] = 1000;
+    /** Keyboard / gamepad-without-aux AUX1: mirrors the arm toggle (set by main). */
+    this.armIndicator = false;
+    this._pending = [];              // frames delayed by the emulated link
+    this._kbFrameT = -Infinity;
+    this._gpSamples = [];            // [{ tw, axes }] from the 250 Hz sampler
+    this._sampler = null;
+    this._serialQueue = [];
+    this.serial = null;
+    this.frameWall = 0;
+    this.prevFrameWall = 0;
 
     /* ---- keyboard ---- */
     this.keys = new Set();
@@ -106,17 +134,13 @@ export class InputManager {
     this.rawGamepad = { axes: [], buttons: [], connected: false, id: '' };
 
     /* ---- RC link emulation ---- */
-    this._linkQ = [];               // {t, thr, pitch, roll, yaw} queue, oldest first
     this.linkHeld = false;          // true this frame: a dropped packet was held over
     this.linkFailsafe = false;      // true while the hold has run long enough to ramp to neutral
     this.linkLatencyMs = 12;
     this.linkLossPct = 0;
-    this._holdMs = 0;
-    this._lastDelivered = null;     // last frame actually applied to this.controls
-    this._linkClockMs = 0;          // simulated clock driven by dt, not wall time
 
     /* ---- source arbitration ---- */
-    this.activeSource = 'keyboard'; // 'keyboard' | 'gamepad'
+    this.activeSource = 'keyboard'; // 'keyboard' | 'gamepad' | 'serial'
 
     /* ---- discrete actions queued this frame ---- */
     this._actions = new Set();
@@ -166,6 +190,12 @@ export class InputManager {
       console.warn('[InputManager] failed to attach listeners', err);
     }
 
+    try {
+      if (!this._sampler && typeof setInterval === 'function') {
+        this._sampler = setInterval(() => this._sampleGamepad(), GAMEPAD_SAMPLE_MS);
+      }
+    } catch (_e) { /* no timers: per-frame sampling only */ }
+
     if (!this.gamepadSupported && !this._notifiedNoGamepadApi) {
       this._notifiedNoGamepadApi = true;
       this._emitDevice('warn', 'Game controller not detected — keyboard controls are active.');
@@ -183,6 +213,7 @@ export class InputManager {
       window.removeEventListener('gamepadconnected', this._onGamepadConnected);
       window.removeEventListener('gamepaddisconnected', this._onGamepadDisconnected);
     } catch (_e) { /* ignore */ }
+    if (this._sampler) { clearInterval(this._sampler); this._sampler = null; }
     this.clearAll();
   }
 
@@ -316,9 +347,12 @@ export class InputManager {
     this.controls.roll = 0;
     this.controls.yaw = 0;
     this._actions.clear();
-    this._linkQ.length = 0;
-    this._lastDelivered = null;
-    this._holdMs = 0;
+    this._pending.length = 0;
+    this._gpSamples.length = 0;
+    this._serialQueue.length = 0;
+    this.controls.channels.fill(1500);
+    this.controls.channels[2] = 1000;
+    this.controls.rxFrames = [];
     this.linkHeld = false;
     this.linkFailsafe = false;
   }
@@ -949,15 +983,7 @@ export class InputManager {
   }
 
   /** Full normalisation pass for the three rotational axes. */
-  _shapeRotational(raw, sensitivity, dz, expoAmount) {
-    if (!Number.isFinite(raw)) return 0;
-    let v = clamp(raw, -1, 1);
-    v = InputManager.deadzoneBipolar(v, dz);
-    v = InputManager.expo(v, expoAmount);
-    v *= Number.isFinite(sensitivity) ? sensitivity : 1;
-    // Final hard clamp — sensitivity above 1.0 can push past the valid range.
-    return clamp(v, -1, 1);
-  }
+
 
   /* ====================================================================== *
    * Per-frame update
@@ -984,11 +1010,19 @@ export class InputManager {
     }
 
     // --- source arbitration -------------------------------------------
+    const tNow = now();
+    this.prevFrameWall = this.frameWall || tNow;
+    this.frameWall = tNow;
+    const serialFresh = !!this.serial && (tNow - this.serial.stats.lastFrameWall) < SERIAL_FRESH_MS;
     const override = settings.get('inputMode');
     if (override === 'keyboard') {
       this.activeSource = 'keyboard';
     } else if (override === 'gamepad') {
       this.activeSource = this.rawGamepad.connected ? 'gamepad' : 'keyboard';
+    } else if (override === 'serial') {
+      this.activeSource = 'serial';
+    } else if (serialFresh) {
+      this.activeSource = 'serial';
     } else {
       // Auto: whichever device the pilot touched most recently wins, so they
       // can swap mid-flight without opening a menu.
@@ -996,111 +1030,167 @@ export class InputManager {
       else this.activeSource = this._gpActiveAt >= this._kbActiveAt ? 'gamepad' : 'keyboard';
     }
 
-    const src = this.activeSource === 'gamepad' ? this._gp : this._kb;
+    this._produceFrames(dt, tNow);
 
-    const dz = settings.get('deadzone');
-    const ex = settings.get('expo');
-    const sens = settings.get('sensitivity');
-
-    // Keyboard axes are already shaped by the ramp and are exactly 0/±1, so
-    // running a dead zone over them would only clip the ramp's early travel.
-    const isPad = this.activeSource === 'gamepad';
-    const padDz = isPad ? dz : 0;
-
-    const shapedPitch = this._shapeRotational(src.pitch, sens.pitch, padDz, ex);
-    const shapedRoll = this._shapeRotational(src.roll, sens.roll, padDz, ex);
-    const shapedYaw = this._shapeRotational(src.yaw, sens.yaw, padDz, ex);
-
-    // Throttle stays linear: an expo'd throttle makes hover trim unpredictable.
-    let thr = Number.isFinite(src.throttle) ? clamp(src.throttle, 0, 1) : 0;
-    if (isPad && !settings.get('springThrottle')) {
-      thr = InputManager.deadzoneUnipolar(thr, dz);
-    }
-    thr = clamp(thr, 0, 1);
-
-    this._updateLink(dt, thr, shapedPitch, shapedRoll, shapedYaw);
+    // Normalised mirror of the newest channels, for the HUD and diagnostics.
+    const ch = this.controls.channels;
+    this.controls.roll = (ch[0] - 1500) / 500;
+    this.controls.pitch = (ch[1] - 1500) / 500;
+    this.controls.throttle = clamp((ch[2] - 1000) / 1000, 0, 1);
+    this.controls.yaw = (ch[3] - 1500) / 500;
+    this.controls.switchArming = this.activeSource === 'serial' ||
+      (this.activeSource === 'gamepad' && this._hasAuxBinding());
+    this.controls.lq = this.activeSource === 'serial' && this.serial ? this.serial.stats.lq : NaN;
 
     return this.controls;
   }
 
   /* ====================================================================== *
-   * RC link emulation
+   * RC channels and frames
    * ====================================================================== */
 
+  /** True when the gamepad mapping binds AUX1 (switch-based arming). */
+  _hasAuxBinding() {
+    const map = settings.get('gamepadMapping');
+    return !!(map && map.aux1 && map.aux1.type === 'axis');
+  }
+
+  /** Mode channel for sources without a mode switch (keys 1/2). */
+  _modeChannelUs() {
+    const m = settings.get('flightMode');
+    return m === 'angle' ? 1000 : m === 'horizon' ? 1500 : 2000;
+  }
+
+  /** 16 channels from normalised sticks + AUX values (µs or NaN for default). */
+  _channelsFrom(roll, pitch, thr, yaw, aux) {
+    const ch = new Float32Array(16);
+    const bip = (v) => 1500 + 500 * clamp(Number.isFinite(v) ? v : 0, -1, 1);
+    ch[0] = bip(roll);
+    ch[1] = bip(pitch);
+    ch[2] = 1000 + 1000 * clamp(Number.isFinite(thr) ? thr : 0, 0, 1);
+    ch[3] = bip(yaw);
+    for (let i = 0; i < 12; i++) {
+      const v = aux ? aux[i] : NaN;
+      if (Number.isFinite(v)) ch[4 + i] = v;
+      else if (i === 0) ch[4] = this.armIndicator ? 2000 : 1000;
+      else if (i === 1) ch[5] = this._modeChannelUs();
+      else ch[4 + i] = 1000;
+    }
+    return ch;
+  }
+
+  /** Reorder a receiver's first four channels into AETR. */
+  _applyChannelMap(chUs) {
+    const out = new Float32Array(16);
+    for (let i = 0; i < 16; i++) out[i] = Number.isFinite(chUs[i]) ? chUs[i] : 1500;
+    if (settings.get('rxChannelMap') === 'TAER') {
+      // source: T A E R → AETR
+      out[0] = chUs[1]; out[1] = chUs[2]; out[2] = chUs[0]; out[3] = chUs[3];
+    }
+    return out;
+  }
+
+  /** 250 Hz: snapshot the selected pad's axes with a wall stamp. */
+  _sampleGamepad() {
+    if (!this.gamepadSupported || this.gamepadIndex === null) return;
+    try {
+      const pads = navigator.getGamepads();
+      const pad = pads && pads[this.gamepadIndex];
+      if (!pad || !pad.axes) return;
+      this._gpSamples.push({ tw: now(), axes: Array.from(pad.axes) });
+      if (this._gpSamples.length > 64) this._gpSamples.shift();
+    } catch (_e) { /* ignore */ }
+  }
+
+  /** Channels for one gamepad axis snapshot. */
+  _gamepadChannels(axes) {
+    const map = settings.get('gamepadMapping');
+    const q = axes.map((v) => {
+      const c = Number.isFinite(v) ? clamp(v, -1, 1) : 0;
+      return clamp(Math.round(c * 512) / 512 + (Math.random() - 0.5) * 0.004, -1, 1);
+    });
+    const pad = { axes: q };
+    const thr = settings.get('springThrottle') ? this._gp.throttle : this._readAxis(pad, map.throttle);
+    const aux = new Array(12).fill(NaN);
+    AUX_KEYS.forEach((k, i) => {
+      const b = map[k];
+      if (b && b.type === 'axis') aux[i] = 1500 + 500 * this._readAxis(pad, { ...b, mode: 'bipolar' });
+    });
+    return this._channelsFrom(this._readAxis(pad, map.roll), this._readAxis(pad, map.pitch), thr, this._readAxis(pad, map.yaw), aux);
+  }
+
   /**
-   * Model the radio link between the shaped stick output above and what the
-   * flight controller actually receives: fixed transport latency, packet
-   * loss with zero-order hold, and a failsafe ramp to neutral when a hold
-   * runs long enough to be a real link loss rather than one dropped packet.
-   *
-   * Writes the final `this.controls` values; `update()` never assigns them
-   * directly so every path (keyboard included — a real link delays both)
-   * goes through here.
+   * Build this render frame's RX frames from the active source, apply the
+   * emulated link (latency, loss) to keyboard and gamepad frames, and publish
+   * those whose (delayed) time has come.
    */
-  _updateLink(dt, thr, pitch, roll, yaw) {
+  _produceFrames(dt, tNow) {
+    const out = [];
+    const src = this.activeSource;
+    const emulate = src !== 'serial';
+    const fresh = [];
+
+    if (src === 'serial') {
+      for (const f of this._serialQueue) fresh.push({ tw: f.tw, ch: this._applyChannelMap(f.ch) });
+      this._serialQueue.length = 0;
+    } else if (src === 'gamepad' && !this.calibrating && !this.remapTarget) {
+      const samples = this._gpSamples.splice(0, this._gpSamples.length);
+      if (samples.length === 0 && this.rawGamepad.connected) samples.push({ tw: tNow, axes: this.rawGamepad.axes });
+      for (const smp of samples) fresh.push({ tw: smp.tw, ch: this._gamepadChannels(smp.axes) });
+    } else {
+      this._gpSamples.length = 0;
+      if (!(tNow - this._kbFrameT < 100)) this._kbFrameT = tNow - KEYBOARD_FRAME_MS;
+      const k = src === 'keyboard' ? this._kb : { throttle: 0, pitch: 0, roll: 0, yaw: 0 };
+      while (this._kbFrameT + KEYBOARD_FRAME_MS <= tNow) {
+        this._kbFrameT += KEYBOARD_FRAME_MS;
+        fresh.push({ tw: this._kbFrameT, ch: this._channelsFrom(k.roll, k.pitch, k.throttle, k.yaw, null) });
+      }
+    }
+    if (src !== 'serial') this._serialQueue.length = 0;
+
+    // RC link emulation (keyboard and gamepad only): transport latency and
+    // packet loss. A lost packet is simply never delivered; the FC holds the
+    // last frame, and 300 ms without frames is its own failsafe.
     const latencyRaw = settings.get('rcLatencyMs');
     const lossRaw = settings.get('rcLoss');
-    const latency = clamp(Number.isFinite(latencyRaw) ? latencyRaw : 12, 0, 60);
-    const lossPct = clamp(Number.isFinite(lossRaw) ? lossRaw : 0, 0, 5);
-    this.linkLatencyMs = latency;
-    this.linkLossPct = lossPct;
-
-    const dtMs = (Number.isFinite(dt) ? dt : 0) * 1000;
-    this._linkClockMs += dtMs;
-    const t = this._linkClockMs;
-    const frame = {
-      t,
-      thr: Number.isFinite(thr) ? thr : 0,
-      pitch: Number.isFinite(pitch) ? pitch : 0,
-      roll: Number.isFinite(roll) ? roll : 0,
-      yaw: Number.isFinite(yaw) ? yaw : 0,
-    };
-
-    this._linkQ.push(frame);
-    if (this._linkQ.length > 120) this._linkQ.shift();
-
-    // Pop every frame old enough to have cleared the latency window; the
-    // newest one that clears it is what the receiver has just decoded.
-    let delivered = null;
-    while (this._linkQ.length && (t - this._linkQ[0].t) >= latency) {
-      delivered = this._linkQ.shift();
+    this.linkLatencyMs = clamp(Number.isFinite(latencyRaw) ? latencyRaw : 12, 0, 60);
+    this.linkLossPct = clamp(Number.isFinite(lossRaw) ? lossRaw : 0, 0, 5);
+    let dropped = false;
+    for (const f of fresh) {
+      if (emulate) {
+        if (this.linkLossPct > 0 && Math.random() * 100 < this.linkLossPct) { dropped = true; continue; }
+        f.tw += this.linkLatencyMs;
+      }
+      this._pending.push(f);
     }
-    if (!delivered) delivered = this._lastDelivered || frame;
+    this.linkHeld = dropped;
+    this.linkFailsafe = false;
 
-    let lossHold = false;
-    if (lossPct > 0 && Math.random() * 100 < lossPct) {
-      // Dropped packet: repeat the last delivered frame (zero-order hold)
-      // rather than snapping to neutral, exactly like a real receiver.
-      delivered = this._lastDelivered || delivered;
-      lossHold = true;
-      this._holdMs += dtMs;
-    } else {
-      this._holdMs = 0;
+    while (this._pending.length && this._pending[0].tw <= tNow) {
+      const f = this._pending.shift();
+      out.push(f);
+      this.controls.channels.set(f.ch);
     }
-    this.linkHeld = lossHold;
+    if (this._pending.length > 512) this._pending.splice(0, this._pending.length - 512);
+    this.controls.rxFrames = out;
+  }
 
-    let failsafe = false;
-    if (this._holdMs > 300) {
-      failsafe = true;
-      const rate = clamp(5 * (Number.isFinite(dt) ? dt : 0), 0, 1);
-      delivered = {
-        t: delivered.t,
-        thr: delivered.thr + (0 - delivered.thr) * rate,
-        pitch: delivered.pitch + (0 - delivered.pitch) * rate,
-        roll: delivered.roll + (0 - delivered.roll) * rate,
-        yaw: delivered.yaw + (0 - delivered.yaw) * rate,
-      };
+  /** Connect a serial receiver (call from a user gesture). */
+  async connectSerial({ protocol = 'crsf', baud = 420000 } = {}) {
+    if (!this.serial) {
+      this.serial = new SerialRx();
+      this.serial.onFrame((ch, tw) => {
+        this._serialQueue.push({ tw, ch: Float32Array.from(ch) });
+        if (this._serialQueue.length > 256) this._serialQueue.shift();
+      });
+      this.serial.onDisconnect(() => this._emitDevice('warn', 'Receiver disconnected'));
     }
-    this.linkFailsafe = failsafe;
+    await this.serial.connect({ protocol, baud });
+    this._emitDevice('info', `Receiver connected (${protocol.toUpperCase()})`);
+  }
 
-    this._lastDelivered = delivered;
-
-    const fallback = this._lastDelivered || frame;
-    this.controls.throttle = Number.isFinite(delivered.thr)
-      ? clamp(delivered.thr, 0, 1) : clamp(fallback.thr || 0, 0, 1);
-    this.controls.pitch = Number.isFinite(delivered.pitch) ? delivered.pitch : (fallback.pitch || 0);
-    this.controls.roll = Number.isFinite(delivered.roll) ? delivered.roll : (fallback.roll || 0);
-    this.controls.yaw = Number.isFinite(delivered.yaw) ? delivered.yaw : (fallback.yaw || 0);
+  async disconnectSerial() {
+    if (this.serial) await this.serial.disconnect();
   }
 
   /** Drain queued discrete actions. Call once per frame after `update()`. */
@@ -1152,7 +1242,7 @@ export class InputManager {
 
 const EMPTY_ACTIONS = new Set();
 
-export const CALIBRATABLE_AXES = ['throttle', 'yaw', 'pitch', 'roll'];
+export const CALIBRATABLE_AXES = ['throttle', 'yaw', 'pitch', 'roll', 'aux1', 'aux2', 'aux3', 'aux4'];
 
 /** Human-readable instruction for each calibration step. */
 export const CALIBRATION_STEPS = {
@@ -1160,6 +1250,11 @@ export const CALIBRATION_STEPS = {
   yaw: 'Sweep the YAW stick fully left, then fully right. Finish holding it RIGHT.',
   pitch: 'Sweep the PITCH stick fully back, then fully forward. Finish holding it FORWARD.',
   roll: 'Sweep the ROLL stick fully left, then fully right. Finish holding it RIGHT.',
+  // AUX switches record their full range; "up" is the positive end.
+  aux1: 'Flip AUX 1 (arm switch) through its full range. Finish with it UP.',
+  aux2: 'Flip AUX 2 (mode switch) through its full range. Finish with it UP.',
+  aux3: 'Flip AUX 3 through its full range. Finish with it UP.',
+  aux4: 'Flip AUX 4 through its full range. Finish with it UP.',
 };
 
 /**
@@ -1181,6 +1276,8 @@ const REMAP_KIND = {
   throttle: 'axis', yaw: 'axis', pitch: 'axis', roll: 'axis',
   arm: 'button', reset: 'button', mode: 'button',
   camera: 'button', turtle: 'button', pause: 'button',
+  aux1: 'axis', aux2: 'axis', aux3: 'axis', aux4: 'axis',
+  aux5: 'axis', aux6: 'axis', aux7: 'axis', aux8: 'axis',
 };
 
 function isFlightKey(code) {

@@ -14,7 +14,7 @@
  * level, back along the cliff foot, through the village and over the dunes.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import { OutdoorWorld, scatter } from '../world/OutdoorKit.js';
 import { Simplex, smoothstep, DistanceField, smoothPath } from '../world/Noise.js';

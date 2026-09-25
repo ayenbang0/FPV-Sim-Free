@@ -12,11 +12,12 @@
  *
  * Run with:  npm test
  */
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { PhysicsWorld } from '../src/core/PhysicsWorld.js';
 import { DroneController } from '../src/core/DroneController.js';
 import { MAP_REGISTRY } from '../src/maps/registry.js';
+import { settings } from '../src/core/Settings.js';
 import { staticBodies, blockedAt } from './mapcheck.mjs';
 
 // Headless texture generators warn once about the missing canvas; mute it.
@@ -31,7 +32,7 @@ const check = (name, pass, detail) => {
 
 function build(Ctor) {
   const scene = new THREE.Scene();
-  const physics = new PhysicsWorld({ fixedTimeStep: 1 / 240 });
+  const physics = new PhysicsWorld({ fixedTimeStep: 1 / 1000 });
   const map = new Ctor();
   for (const _ of map.buildSteps(scene, physics)) { /* exhaust */ }
   return { scene, physics, map };
@@ -161,6 +162,39 @@ console.log('\n=== signature features ===\n');
 }
 
 /* ========================================================================== *
+ * B2. MultiGP gate spec: square gates shrink in place to 5 ft (hurdles 10×5)
+ * ========================================================================== */
+
+console.log('\n=== multigp gate spec ===\n');
+{
+  settings.set('gateSpec', 'multigp');
+  const { physics, map } = build(byId.arena.Ctor);
+  const at = (g, dr, du) => [
+    g.position.x + g.right.x * dr + g.up.x * du,
+    g.position.y + g.right.y * dr + g.up.y * du,
+    g.position.z + g.right.z * dr + g.up.z * du,
+  ];
+  const squares = map.gates.filter((g) => g.shape === 'square');
+  const openBad = [];
+  const frameBad = [];
+  for (const g of squares) {
+    const hurdle = g.halfW > g.halfH * 1.5;
+    for (const [dr, du] of [[0, 0], [0.6, 0], [-0.6, 0], [0, 0.6], [0, -0.6]]) {
+      if (solidAt(map, physics, ...at(g, dr, du))) openBad.push(`gate${g.index + 1}(${dr},${du})`);
+    }
+    const frame = [[0, 0.9], [0, -0.9]];
+    if (!hurdle) frame.push([0.9, 0], [-0.9, 0]);
+    for (const [dr, du] of frame) {
+      if (!solidAt(map, physics, ...at(g, dr, du), 0.05)) frameBad.push(`gate${g.index + 1}(${dr},${du})`);
+    }
+  }
+  check('multigp: square gates open at centre and ±0.6 m', squares.length > 0 && openBad.length === 0,
+    openBad.join(' ') || `${squares.length} gates`);
+  check('multigp: ±0.9 m hits the frame', frameBad.length === 0, frameBad.join(' ') || 'all solid');
+  settings.set('gateSpec', 'league');
+}
+
+/* ========================================================================== *
  * C. Streaming: far colliders stay out of the world, near ones come in
  * ========================================================================== */
 
@@ -178,16 +212,16 @@ console.log('\n=== collider streaming ===\n');
 }
 {
   // Dynamic-vs-static broadphase must still collide with a plain plane.
-  const physics = new PhysicsWorld({ fixedTimeStep: 1 / 240 });
+  const physics = new PhysicsWorld({ fixedTimeStep: 1 / 1000 });
   const ground = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
   ground.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
   physics.addBody(ground);
   const drone = new DroneController(physics, 'freestyle');
   drone.setSpawn(new THREE.Vector3(0, 2, 0), 0, 0);
   drone.respawn();
-  for (let i = 0; i < 480; i++) {
-    drone.update(1 / 240, { throttle: 0, pitch: 0, roll: 0, yaw: 0 });
-    physics.step(1 / 240);
+  for (let i = 0; i < 2000; i++) {
+    drone.update(1 / 1000, { throttle: 0, pitch: 0, roll: 0, yaw: 0 });
+    physics.step(1 / 1000);
     physics.sanitizeBody(drone.body);
     drone.afterStep();
   }

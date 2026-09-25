@@ -12,8 +12,8 @@
  * Shares its widgets with MainMenu so the two screens look like one product.
  */
 
-import { settings, RATE_PRESETS, RATE_PRESET_IDS } from '../core/Settings.js';
-import { button, heading, kvTable, selectRow, sliderRow, toggleRow } from './MainMenu.js';
+import { settings } from '../core/Settings.js';
+import { button, heading, kvTable, selectRow, sliderRow, toggleRow, renderBetaflightTuning } from './MainMenu.js';
 import { formatTime } from './HUD.js';
 import { listAirframes } from '../core/DroneTypes.js';
 
@@ -102,6 +102,7 @@ export class PauseMenu {
     panel.append(selectRow('Mode', {
       options: [
         { value: 'angle', label: 'Angle — self-levelling (beginner)' },
+        { value: 'horizon', label: 'Horizon — levels at centre stick' },
         { value: 'acro', label: 'Acro — rate only (realistic)' },
       ],
       value: settings.get('flightMode'),
@@ -113,59 +114,12 @@ export class PauseMenu {
 
     const modeHint = document.createElement('p');
     modeHint.className = 'hint';
-    modeHint.innerHTML = 'Also switchable in flight with <kbd>1</kbd> (Acro) and <kbd>2</kbd> (Angle).';
+    modeHint.innerHTML = 'Also switchable in flight with <kbd>1</kbd> (Acro) and <kbd>2</kbd> (Angle). ' +
+      'A radio with ANGLE/HORIZON mode ranges (Settings → Radio) overrides this.';
     panel.append(modeHint);
 
-    /* ---- flight tuning ---- */
-    panel.append(heading('Flight tuning'));
-    // Every slider below writes through settings.set() (which re-sanitizes),
-    // and drops non-finite input on the floor so a stray NaN keeps last-good.
-    const tuned = (fn) => (v) => {
-      if (!Number.isFinite(v)) return;
-      fn(v);
-      this.deps.onSettingsChanged?.();
-    };
-    for (const term of ['p', 'i', 'd']) {
-      panel.append(sliderRow(`PID ${term.toUpperCase()} scale`, {
-        min: 0, max: 2, step: 0.01, value: settings.get('pidScale')[term],
-        format: (v) => `${v.toFixed(2)}x`,
-        onInput: tuned((v) => settings.set('pidScale', { ...settings.get('pidScale'), [term]: v })),
-      }));
-    }
-    panel.append(sliderRow('TPA cutoff', {
-      min: 0, max: 0.99, step: 0.01, value: settings.get('tpa').start,
-      format: (v) => `${Math.round(v * 100)}%`,
-      onInput: tuned((v) => settings.set('tpa', { ...settings.get('tpa'), start: v })),
-    }));
-    panel.append(sliderRow('TPA amount', {
-      min: 0, max: 0.6, step: 0.01, value: settings.get('tpa').amount,
-      format: (v) => `${Math.round(v * 100)}%`,
-      onInput: tuned((v) => settings.set('tpa', { ...settings.get('tpa'), amount: v })),
-    }));
-    panel.append(sliderRow('Feedforward', {
-      min: 0, max: 1, step: 0.01, value: settings.get('feedforward'),
-      format: (v) => `${Math.round(v * 100)}%`,
-      onInput: tuned((v) => { settings.set('feedforward', v); }),
-    }));
-    panel.append(sliderRow('Throttle curve', {
-      min: 1, max: 2.5, step: 0.05, value: settings.get('throttleCurve'),
-      format: (v) => `${v.toFixed(2)}`,
-      onInput: tuned((v) => settings.set('throttleCurve', v)),
-    }));
-    panel.append(toggleRow('Airmode', {
-      value: settings.get('airmode'),
-      hint: 'Keeps full stick authority at max throttle instead of clamping.',
-      onChange: (v) => { settings.set('airmode', v); this.deps.onSettingsChanged?.(); },
-    }));
-    panel.append(selectRow('Rate preset', {
-      value: settings.get('ratePreset'),
-      options: RATE_PRESET_IDS.map((id) => ({ value: id, label: RATE_PRESETS[id].label })),
-      onChange: (v) => {
-        settings.loadRatePreset(v);
-        this.deps.onSettingsChanged?.();
-        this.render();
-      },
-    }));
+    /* ---- flight tuning (Betaflight) ---- */
+    renderBetaflightTuning(panel, () => this.deps.onSettingsChanged?.(), () => this.render());
 
     /* ---- visuals ---- */
     panel.append(heading('Visuals'));
@@ -204,6 +158,11 @@ export class PauseMenu {
 
     /* ---- blackbox ---- */
     panel.append(heading('Blackbox'));
+    panel.append(toggleRow('Record blackbox', {
+      value: settings.get('blackbox'),
+      hint: 'Logs every flight-controller loop (last 30 s) in Betaflight CSV columns.',
+      onChange: (v) => { settings.set('blackbox', v); this.deps.onSettingsChanged?.(); },
+    }));
     panel.append(button('Download Blackbox CSV', {
       onClick: () => {
         import('../core/Blackbox.js')

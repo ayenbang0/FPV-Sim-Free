@@ -24,7 +24,7 @@
  * the quad are ever in the physics world.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd, rndInt } from './MapKit.js';
 import {
   concreteTexture, corrugatedMetalTexture, rustTexture, crateWoodTexture,
@@ -102,6 +102,9 @@ export class WarehouseMap {
       shadowRange: 88,
       shadowFocus: [0, 0, 16],
       probe: [0, 6, 24],
+      // Skylight sunbeams: the post pipeline adds screen-space godrays from
+      // the sun's shadow map on high/ultra (the beam cards stay).
+      godrays: true,
     };
     this.builder = null;
     this._prevFog = null;

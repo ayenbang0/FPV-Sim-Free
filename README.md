@@ -409,3 +409,36 @@ definitions and the derivation that turns them into controller gains.
 - [vite](https://vite.dev) `8.2.2` — dev server and bundler
 
 No other runtime dependencies.
+
+## Flight controller
+
+`src/fc/` is a JavaScript port of the Betaflight 2025.12 flight-control path:
+filters (`common/filter.c`), rates and RC smoothing/feedforward (`fc/rc.c`),
+the PID controller with TPA, anti-gravity, I-term relax, D-max and
+self-levelling (`flight/pid.c`, `pid_init.c`), the gyro filter chain with the
+RPM filter (`sensors/gyro*.c`, `flight/rpm_filter.c`), and the mixer with
+airmode and crash flip (`flight/mixer.c`). Every ported function carries a
+`// BF: <file>:<function>` comment naming its source. Settings use Betaflight
+units, so a tune or rate profile copies straight across from the Configurator.
+
+`src/core/QuadPhysics.js` supplies the physical quad the FC flies: battery
+open-circuit voltage and sag, a closed-form ESC/motor bus solve, propeller
+thrust and torque with inflow, ground effect, vortex ring, translational lift
+and rotor drag, rotor inertia and gyroscopic torque. Radios connect through
+the Gamepad API (EdgeTX/OpenTX joystick presets) or WebSerial (CRSF/SBUS
+receivers, `src/input/SerialRx.js`).
+
+`tests/tune-check.mjs` is a development tool (not part of `npm test`) that
+reports each airframe's stock-tune roll step response.
+
+## License
+
+The simulator as a whole is distributed under the **GNU General Public
+License, version 3 or later** (`GPL-3.0-or-later`, full text in `COPYING`),
+because `src/fc/` is derived from [Betaflight](https://github.com/betaflight/betaflight),
+which is GPL-3.0-or-later.
+
+The files not derived from Betaflight were first published under the Apache
+License 2.0 (`LICENSE`). Apache-2.0 code may be included in a GPLv3 work, so
+those files remain available under Apache-2.0 on their own, while the combined
+program is under the GPL.

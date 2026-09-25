@@ -16,12 +16,18 @@
  * hides itself on dirt, gravel, forest floor, steep rock and under water. The
  * outer 30 % of the range fades blades down to nothing, so there is no edge.
  *
- * Lighting uses the stock MeshStandardMaterial (sun, shadows, fog, IBL) with a
- * mostly-up normal, which is how real grass reads from above: a lit carpet,
- * not a field of dark vertical slivers.
+ * Lighting uses a stock MeshStandardNodeMaterial (sun, shadows, fog, IBL) with
+ * a mostly-up normal, which is how real grass reads from above: a lit carpet,
+ * not a field of dark vertical slivers. The placement runs in the material's
+ * `positionNode` (TSL), which also rewrites the vertex normal.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import {
+  Fn, float, vec2, vec3, vec4, ivec2, uniform, texture, textureLoad, attribute, varyingProperty,
+  clamp, cos, sin, floor, length, mix, mod, normalize, smoothstep, step,
+  positionGeometry, normalLocal,
+} from 'three/tsl';
 import { makeRng } from '../assets/procedural.js';
 import { activeQuality } from '../render/Quality.js';
 
@@ -98,114 +104,89 @@ export class Grass {
     const splatTex = terrain.splatTexture();
     const hs = terrain._heightTexSize || 1024;
 
+    // Same names as the former GLSL uniforms; `update()` writes the values.
     this.uniforms = {
-      uCam: { value: new THREE.Vector2() },
-      uTile: { value: tile },
-      uRange: { value: this.range },
-      uTime: { value: 0 },
-      uBladeH: { value: bladeHeight },
-      uWind: { value: new THREE.Vector2(0.18, 0.08) },
-      uWater: { value: waterLevel },
-      tHeight: { value: heightTex },
-      uHRect: { value: new THREE.Vector4(-terrain.half, -terrain.half, terrain.size, hs) },
-      tGSplat: { value: splatTex },
-      uSRect: { value: new THREE.Vector4(-terrain.half, -terrain.half, terrain.size, terrain.size) },
-      uTint: { value: new THREE.Color(tint) },
-      uDry: { value: new THREE.Color(dryTint) },
+      uCam: uniform(new THREE.Vector2()),
+      uTile: uniform(tile),
+      uRange: uniform(this.range),
+      uTime: uniform(0),
+      uBladeH: uniform(bladeHeight),
+      uWind: uniform(new THREE.Vector2(0.18, 0.08)),
+      uWater: uniform(waterLevel),
+      tHeight: heightTex,
+      uHRect: uniform(new THREE.Vector4(-terrain.half, -terrain.half, terrain.size, hs)),
+      tGSplat: texture(splatTex),
+      uSRect: uniform(new THREE.Vector4(-terrain.half, -terrain.half, terrain.size, terrain.size)),
+      uTint: uniform(new THREE.Color(tint)),
+      uDry: uniform(new THREE.Color(dryTint)),
     };
+    const U = this.uniforms;
 
-    const mat = new THREE.MeshStandardMaterial({
+    const mat = new THREE.MeshStandardNodeMaterial({
       color: 0xffffff, roughness: 0.92, metalness: 0, side: THREE.DoubleSide,
     });
     mat.name = 'GrassMaterial';
-    const U = this.uniforms;
-    mat.onBeforeCompile = (shader) => {
-      Object.assign(shader.uniforms, U);
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', `#include <common>
-          attribute vec4 aOffset;
-          uniform vec2 uCam;
-          uniform float uTile;
-          uniform float uRange;
-          uniform float uTime;
-          uniform float uBladeH;
-          uniform vec2 uWind;
-          uniform float uWater;
-          uniform sampler2D tHeight;
-          uniform vec4 uHRect;
-          uniform sampler2D tGSplat;
-          uniform vec4 uSRect;
-          varying float vGT;
-          varying float vGDry;
-          vec3 gBladePos;
-          vec3 gBladeN;
-          float gHeightAt(vec2 wxz, out vec2 grad) {
-            float n = uHRect.w;
-            vec2 uv = (wxz - uHRect.xy) / uHRect.z * (n - 1.0);
-            uv = clamp(uv, vec2(0.0), vec2(n - 1.001));
-            vec2 i = floor(uv);
-            vec2 f = uv - i;
-            ivec2 p = ivec2(i);
-            float a = texelFetch(tHeight, p, 0).r;
-            float b = texelFetch(tHeight, p + ivec2(1, 0), 0).r;
-            float c = texelFetch(tHeight, p + ivec2(0, 1), 0).r;
-            float d = texelFetch(tHeight, p + ivec2(1, 1), 0).r;
-            float cellM = uHRect.z / (n - 1.0);
-            grad = vec2(mix(b - a, d - c, f.y), mix(c - a, d - b, f.x)) / cellM;
-            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
-          }
-          void gBlade() {
-            vec2 rel = mod(aOffset.xy - uCam + 0.5 * uTile, uTile) - 0.5 * uTile;
-            vec2 wxz = uCam + rel;
-            float dist = length(rel);
-            float fade = 1.0 - smoothstep(uRange * 0.62, uRange * 0.98, dist);
-            vec2 grad;
-            float h = gHeightAt(wxz, grad);
-            vec4 sp = texture2D(tGSplat, (wxz - uSRect.xy) / uSRect.zw);
-            float slope = length(grad);
-            float mask = (1.0 - smoothstep(0.25, 0.55, sp.r))
-                       * (1.0 - smoothstep(0.25, 0.55, sp.b))
-                       * (1.0 - 0.75 * smoothstep(0.3, 0.8, sp.a))
-                       * (1.0 - smoothstep(0.45, 0.8, slope))
-                       * step(uWater + 0.12, h);
-            float scale = fade * mask * aOffset.w;
-            vGDry = sp.g;
-            float rot = aOffset.z * 6.2831853;
-            float cs = cos(rot);
-            float sn = sin(rot);
-            // Blades widen with distance so the thinning outer ring still reads as a carpet.
-            float widen = 1.0 + 1.6 * dist / uRange;
-            vec3 p = position;
-            p.x *= widen;
-            vec3 r = vec3(p.x * cs, 0.0, p.x * sn);
-            float t = p.y;
-            float hgt = uBladeH * scale * (0.8 + 0.4 * sp.g);
-            float gust = sin(uTime * 1.9 + wxz.x * 0.23 + wxz.y * 0.17) * 0.55
-                       + sin(uTime * 3.7 + wxz.x * 0.61 - wxz.y * 0.43) * 0.25 + 0.45;
-            vec2 lean = uWind * gust + vec2(cos(rot * 1.7), sin(rot * 1.3)) * 0.12;
-            gBladePos = vec3(wxz.x, h, wxz.y) + r * scale + vec3(0.0, t * hgt, 0.0)
-                      + vec3(lean.x, 0.0, lean.y) * t * t * hgt;
-            gBladeN = normalize(vec3(-grad.x, 1.0, -grad.y) + vec3(sn, 0.0, -cs) * 0.25);
-            vGT = t;
-          }
-        `)
-        .replace('#include <beginnormal_vertex>', `gBlade();
-          vec3 objectNormal = gBladeN;
-          #ifdef USE_TANGENT
-            vec3 objectTangent = vec3(1.0, 0.0, 0.0);
-          #endif`)
-        .replace('#include <begin_vertex>', 'vec3 transformed = gBladePos;');
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', `#include <common>
-          uniform vec3 uTint;
-          uniform vec3 uDry;
-          varying float vGT;
-          varying float vGDry;`)
-        .replace('#include <color_fragment>', `#include <color_fragment>
-          vec3 gCol = mix(uTint, uDry, clamp(vGDry * 0.8, 0.0, 1.0));
-          diffuseColor.rgb *= gCol * mix(0.38, 1.08, vGT);`);
+
+    const aOffset = attribute('aOffset', 'vec4');
+    const vGT = varyingProperty('float', 'vGT');
+    const vGDry = varyingProperty('float', 'vGDry');
+
+    /** Manual bilinear height (texelFetch) plus its gradient, in metres. */
+    const gHeightAt = (wxz) => {
+      const n = U.uHRect.w;
+      const uv = clamp(wxz.sub(U.uHRect.xy).div(U.uHRect.z).mul(n.sub(1.0)), vec2(0.0), vec2(n.sub(1.001))).toVar();
+      const i = floor(uv);
+      const f = uv.sub(i).toVar();
+      const p = ivec2(i).toVar();
+      const a = textureLoad(U.tHeight, p, 0).r.toVar();
+      const b = textureLoad(U.tHeight, p.add(ivec2(1, 0)), 0).r.toVar();
+      const c = textureLoad(U.tHeight, p.add(ivec2(0, 1)), 0).r.toVar();
+      const d = textureLoad(U.tHeight, p.add(ivec2(1, 1)), 0).r.toVar();
+      const cellM = U.uHRect.z.div(n.sub(1.0));
+      const grad = vec2(mix(b.sub(a), d.sub(c), f.y), mix(c.sub(a), d.sub(b), f.x)).div(cellM);
+      const h = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      return { h, grad };
     };
-    mat.customProgramCacheKey = () => 'fpv-grass-v1';
+
+    mat.positionNode = Fn(() => {
+      const rel = mod(aOffset.xy.sub(U.uCam).add(U.uTile.mul(0.5)), U.uTile).sub(U.uTile.mul(0.5)).toVar();
+      const wxz = U.uCam.add(rel).toVar();
+      const dist = length(rel);
+      const fade = float(1.0).sub(smoothstep(U.uRange.mul(0.62), U.uRange.mul(0.98), dist));
+      const hg = gHeightAt(wxz);
+      const h = hg.h.toVar();
+      const grad = hg.grad.toVar();
+      const sp = U.tGSplat.sample(wxz.sub(U.uSRect.xy).div(U.uSRect.zw)).toVar();
+      const slope = length(grad);
+      const mask = float(1.0).sub(smoothstep(0.25, 0.55, sp.r))
+        .mul(float(1.0).sub(smoothstep(0.25, 0.55, sp.b)))
+        .mul(float(1.0).sub(smoothstep(0.3, 0.8, sp.a).mul(0.75)))
+        .mul(float(1.0).sub(smoothstep(0.45, 0.8, slope)))
+        .mul(step(U.uWater.add(0.12), h));
+      const scale = fade.mul(mask).mul(aOffset.w).toVar();
+      vGDry.assign(sp.g);
+      const rot = aOffset.z.mul(6.2831853).toVar();
+      const cs = cos(rot);
+      const sn = sin(rot);
+      // Blades widen with distance so the thinning outer ring still reads as a carpet.
+      const widen = float(1.0).add(dist.mul(1.6).div(U.uRange));
+      const px = positionGeometry.x.mul(widen);
+      const r = vec3(px.mul(cs), 0.0, px.mul(sn));
+      const t = positionGeometry.y;
+      const hgt = U.uBladeH.mul(scale).mul(float(0.8).add(sp.g.mul(0.4)));
+      const gust = sin(U.uTime.mul(1.9).add(wxz.x.mul(0.23)).add(wxz.y.mul(0.17))).mul(0.55)
+        .add(sin(U.uTime.mul(3.7).add(wxz.x.mul(0.61)).sub(wxz.y.mul(0.43))).mul(0.25)).add(0.45);
+      const lean = U.uWind.mul(gust).add(vec2(cos(rot.mul(1.7)), sin(rot.mul(1.3))).mul(0.12));
+      const bladePos = vec3(wxz.x, h, wxz.y).add(r.mul(scale)).add(vec3(0.0, t.mul(hgt), 0.0))
+        .add(vec3(lean.x, 0.0, lean.y).mul(t).mul(t).mul(hgt));
+      // Mostly-up normal, tilted a touch toward the blade face.
+      normalLocal.assign(normalize(vec3(grad.x.negate(), 1.0, grad.y.negate()).add(vec3(sn, 0.0, cs.negate()).mul(0.25))));
+      vGT.assign(t);
+      return bladePos;
+    })();
+
+    const gCol = mix(U.uTint, U.uDry, clamp(vGDry.mul(0.8), 0.0, 1.0));
+    mat.colorNode = vec4(gCol.mul(mix(0.38, 1.08, vGT)), 1.0);
     this.material = mat;
 
     this.mesh = new THREE.Mesh(geo, mat);

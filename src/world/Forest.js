@@ -20,7 +20,7 @@
  * two soft canopy spheres per tree, built only while the drone is nearby.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { GROUP } from '../core/PhysicsWorld.js';

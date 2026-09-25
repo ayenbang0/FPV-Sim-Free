@@ -12,7 +12,7 @@
  * sun below the horizon, and the gates' LEDs become the brightest thing out.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder } from './MapKit.js';
 import { grassTexture } from '../assets/procedural.js';
 

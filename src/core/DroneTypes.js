@@ -1,170 +1,117 @@
 /**
  * core/DroneTypes.js
  * ---------------------------------------------------------------------------
- * Three airframes, and the machinery that turns a physical description of one
- * into a stable controller tune.
+ * The airframes: a physical description of each quad (mass, geometry, motor,
+ * ESC, propeller, battery and drag figures) plus its stock Betaflight tune.
+ * QuadPhysics.js turns the physical numbers into forces; src/fc runs the tune.
  *
- *   tinywhoop  BetaFPV Air65 class — 65 mm, 23 g, 1S. Slow, draggy, blown
- *              around by a breeze, and completely at home inside a house.
- *   freestyle  250 mm, 650 g, 4S. The everyday 5" quad. Balanced.
- *   racer      210 mm, 580 g, 6S. 8:1 thrust, 900 deg/s rates, low drag.
- *              Enormously fast and utterly unforgiving.
+ * Every performance number the UI shows — thrust-to-weight, hover throttle,
+ * top RPM — is *derived* here from those physical figures, never typed in:
  *
- * ---------------------------------------------------------------------------
- * WHY THE GAINS ARE DERIVED RATHER THAN TYPED IN
+ *   V      = cells · 3.9                        loaded nominal pack voltage
+ *   ωmax   = Kv_rad·(V − Rm·(qRatio·Tmax/Kt + I0))   full-throttle rotor speed
+ *   kT     = Tmax / ωmax²                        static thrust coefficient
+ *            (then refined against the steady-state bus solve, so Tmax is
+ *            exactly the full-duty static thrust on a fresh pack)
+ *   kQ     = qRatio · kT                         torque coefficient
+ *   hover  = bisection on the steady-state bus solve (4 motors lifting weight)
  *
- * A rate PID is not tuned against a feeling, it is tuned against the airframe's
- * *angular acceleration authority* — how hard the motors can twist the frame.
- * Hand-typing three sets of gains means three chances to produce a quad that
- * oscillates, and the failure is invisible: it builds clean, renders clean, and
- * only shows up as a tumble when you actually fly it.
+ * Top speed and idle sink depend on the whole closed loop, so they are
+ * measured by flying the model (tests/fit-aero.mjs) and recorded per airframe.
  *
- * So each airframe declares its physical properties, and `derive()` computes:
- *
- *     alphaMax = (2 · arm · thrustMax) / I          rad/s² at full mix
- *     Kp       = 1 / (tau · alphaMax)               closed-loop time constant tau
- *     Ki       = Kp / integralTime
- *     Kd       = D_AUTHORITY / alphaMax
- *
- * The `2 ·` in alphaMax is the air-mode halving: a full pitch command produces
- * motors [0, 0, 1, 1], so two motors push and two idle — not four.
- *
- * Kd deliberately does **not** scale with Kp. What destabilises the derivative
- * term is the product `Kd · alphaMax` (one saturated substep changes the
- * measured rate by alphaMax · dt, and D feeds that straight back). The whoop has
- * ~1.4x the 5"'s authority but a *lower* Kp, so scaling Kd off Kp would push it
- * the wrong way and tumble the smallest airframe. Holding `Kd · alphaMax`
- * constant is what actually keeps the loop equivalent across all three.
- *
- * ---------------------------------------------------------------------------
- * THRUST CURVE
- *
- * Propeller thrust goes as the square of RPM, and an ESC maps its command
- * roughly linearly onto RPM. Treating thrust as linear in the motor command —
- * which the first version of this simulator did — makes the bottom half of the
- * throttle range far too strong and the top half too weak.
- *
- *     thrust = thrustMax · command^k          k ≈ 1.7 - 2.0
- *
- * This is why hover does not sit at `weight / maxThrust`. Inverting the curve
- * gives the real hover command, and it lands somewhere genuinely useful: 27% of
- * stick on the racer (twitchy, all the authority is in the first third) versus
- * 56% on the whoop (docile, hover is right at mid-stick). That single
- * consequence does more to differentiate how the three feel than any other
- * number in this file.
- *
- * Motors also idle rather than stopping (`motorIdle`), like a real quad with a
- * DShot idle offset. Without it, the thrust curve's near-zero slope at zero
- * command would collapse attitude authority whenever the pilot chopped throttle.
+ * Stock tunes are Betaflight units (P/I/D/Dmax/F), rates are Actual rates:
+ * `rcRates` = centre ÷ 10, `rates` = max ÷ 10, `rcExpo` = expo %. Yaw uses the
+ * roll curve with 0.8 × the roll max.
  */
 
-/* ========================================================================== *
- * Tuning constants shared by all airframes
- * ========================================================================== */
+import { motorConstants, steadyState, cellOcv } from './QuadPhysics.js';
 
 /**
- * Closed-loop time constant for the rate controller, per axis group.
- * Smaller = crisper. These are the only "feel" numbers here; everything else
- * follows from physics.
+ * Stock Actual-rates profile in BF integer units.
+ * @param {number} center  deg/s
+ * @param {number} max     deg/s (roll and pitch; yaw gets 0.8×)
+ * @param {number} expo    %
  */
-const YAW_TAU = 0.079;             // s — yaw is always softer than roll/pitch
-
-/** Integral time constant: Ki = Kp / INTEGRAL_TIME. */
-const INTEGRAL_TIME = 0.321;       // s
-const YAW_INTEGRAL_TIME = 0.600;   // s
-
-/**
- * The invariant that keeps the D term safe across airframes.
- * Equals the 5" reference tune's Kd · alphaMax (0.00035 × 366).
- */
-const D_AUTHORITY = 0.128;
-
-/** Wind is a pressure (N/m²); each airframe multiplies by its own frontal area. */
-export const WIND_PRESSURE = 34;
-
-/* ========================================================================== *
- * Airframe definitions
- * ========================================================================== */
+function actualRates(center, max, expo) {
+  return {
+    type: 'actual',
+    rcRates: [center / 10, center / 10, center / 10],
+    rates: [max / 10, max / 10, Math.round(0.8 * max) / 10],
+    rcExpo: [expo, expo, expo],
+    thrMid: 50,
+    thrExpo: 0,
+    rateLimit: [1998, 1998, 1998],
+  };
+}
 
 /**
  * @typedef {object} AirframeSpec
  * @property {string}  id
- * @property {string}  displayName
- * @property {string}  className        e.g. "65 mm · 1S"
- * @property {string}  description      one line for the selection card
- * @property {number}  mass             kg, all-up weight
- * @property {number}  arm              m, motor offset from centre on X and Z
- * @property {[number,number,number]} body  full collider dimensions (w, h, d)
- * @property {number}  thrustToWeight   static thrust ratio
- * @property {number}  thrustExponent   k in thrust = max · command^k
- * @property {number}  motorIdle        minimum armed motor command
- * @property {number}  motorTau         s, first-order ESC+motor spool lag
- * @property {number}  propDiameterM    m, prop disc diameter
- * @property {number}  propPitchM       m, prop geometric pitch
- * @property {number}  escIdleHz        Hz, audible idle wobble seed
- * @property {number}  packResistance   ohms, full-pack internal resistance
- * @property {number}  yawTorqueCoef    reaction torque as a fraction of arm·thrust
- * @property {number}  tau              rate-loop time constant (s)
- * @property {{roll:number,pitch:number,yaw:number}} rates  deg/s at full stick
- * @property {number}  dragLateral      quadratic drag coefficient, X/Z
- * @property {number}  dragVertical     quadratic drag coefficient, Y
- * @property {number}  angularDamping   cannon angular damping
- * @property {number}  windArea         m², frontal area the wind pushes on
- * @property {number}  maxTilt          deg, Angle-mode ceiling
- * @property {object}  battery          cell chemistry and endurance
- * @property {object}  visual           mesh proportions and colours
- * @property {[number,number,number]} cameraMount  FPV camera offset, m
+ * @property {number}  mass          kg, all-up weight
+ * @property {number}  arm           m, motor offset from centre on X and Z
+ * @property {number[]} body         collider dimensions (w, h, d), m
+ * @property {number}  kv            motor KV, rpm/V
+ * @property {number}  rm            winding resistance, Ω
+ * @property {number}  i0            no-load current, A
+ * @property {number}  escLimit      ESC current limit, A
+ * @property {number}  tmax          static thrust per motor at full throttle, N
+ * @property {number}  propDiameter  m
+ * @property {number}  propPitch     m
+ * @property {number}  qRatio        prop torque / thrust, m
+ * @property {number}  jrot          rotor (motor bell + prop) inertia, kg·m²
+ * @property {number}  rotorDrag     H-force coefficient, N/(rad/s)/(m/s)
+ * @property {number[]} cdA          body drag area [side, top, front], m²
+ * @property {number}  auxCurrent    FC + VTX + camera draw, A
+ * @property {number}  dshotIdle     motor idle, fraction of full duty
+ * @property {number}  vibration     gyro vibration at full RPM, deg/s
+ * @property {number}  propHeight    prop plane above the CG, m
+ * @property {object}  battery       { chemistry, cells, label, mah, resistance }
+ * @property {object}  tune          stock Betaflight tune { pid, filters, rates, angleLimit }
  */
 
 const AIRFRAMES = [
-  /* ------------------------------------------------------------------ *
-   * 1. Tinywhoop — BetaFPV Air65 class
-   * ------------------------------------------------------------------ */
   {
     id: 'tinywhoop',
     displayName: 'Tinywhoop',
-    className: '65 mm · 23 g · 1S',
+    className: '65 mm · 28 g · 1S HV',
     description:
-      'Ducted 65 mm micro. About 7 m/s flat out, and barely 3 m/s in Angle mode — slow enough to thread a doorway and light enough to bounce off everything. The only sane choice indoors.',
+      'Ducted 65 mm micro on 1S HV. Slow, draggy and light enough to bounce off everything — the only sane choice indoors.',
     accent: 'linear-gradient(160deg, #8fd6ff 0%, #4f9fd4 55%, #2c5f80 100%)',
 
-    mass: 0.023,
-    arm: 0.023,                     // 65 mm wheelbase, motors on the diagonal
-    body: [0.075, 0.028, 0.075],    // duct shroud included
-    thrustToWeight: 2.4,            // measured Air65 figures sit around 2.3-2.5
-    thrustExponent: 1.70,
-    motorIdle: 0.06,
-    motorTau: 0.035,                  // 0802 micros spool slower than 2207s
-    propDiameterM: 0.031,             // 31 mm props
-    propPitchM: 0.020,
-    escIdleHz: 55,                    // high thin mosquito-whine wobble seed
-    packResistance: 0.09,             // tired 1S sags hard under punch
-    yawTorqueCoef: 0.105,
-    tau: 0.028,
-    maxPowerW: 35,                  // 1S micro pack: ~35 W all-in
+    mass: 0.028,
+    arm: 0.023,
+    body: [0.075, 0.028, 0.075],
+    kv: 27000,
+    rm: 1.2,
+    i0: 0.1,
+    escLimit: 5,
+    tmax: 0.22,
+    propDiameter: 0.031,
+    propPitch: 0.02,
+    qRatio: 0.003,
+    jrot: 2.5e-8,
+    rotorDrag: 1.2e-7,
+    cdA: [0.00192, 0.0265, 0.00192],
+    auxCurrent: 0.35,
+    dshotIdle: 0.07,
+    vibration: 25,
+    propHeight: 0.012,
+    battery: { chemistry: 'lihv', cells: 1, label: '1S', mah: 300, resistance: 0.06 },
 
-    rates: { roll: 500, pitch: 500, yaw: 330 },
-
-    // Ducts are enormously draggy for their size. Coefficients are solved
-    // backwards from measured behaviour rather than picked: ~7 m/s (25 km/h)
-    // flat out in acro, and a ~3 m/s sink with the throttle chopped, which is
-    // what makes a whoop survivable indoors. In Angle mode the 25 deg tilt cap
-    // holds it to about 3 m/s — roughly walking pace, and the reason these are
-    // the only thing worth flying in a living room.
-    dragLateral: 0.01005,
-    dragVertical: 0.02507,
-    angularDamping: 0.55,
-    windArea: 0.0075,
-    maxTilt: 25,
-
-    battery: {
-      cells: 1, label: '1S',
-      FULL: 4.35, LOW: 3.50, CRITICAL: 3.30, CUTOFF: 3.00, EMPTY: 2.90,
-      HOVER_SECONDS: 240, SAG: 0.45,
-      PEAK_CURRENT: 7,       // A, 0802 motors on a 300 mAh 1S
-      HOVER_CURRENT: 1.6,    // A loafing in a hover — the OSD cruise number
-      CAPACITY_MAH: 300,
+    tune: {
+      pid: {
+        roll: { p: 124, i: 160, d: 89, dMax: 107, f: 60 },
+        pitch: { p: 133, i: 171, d: 98, dMax: 117, f: 65 },
+        yaw: { p: 143, i: 160, d: 0, dMax: 0, f: 60 },
+      },
+      filters: { dtermLpf1Min: 100, dtermLpf1Max: 200, dtermLpf2: 200 },
+      rates: actualRates(200, 700, 50),
+      angleLimit: 45,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 8.2,
+    sinkRate: 3.8,
 
     visual: {
       ducted: true,
@@ -174,57 +121,52 @@ const AIRFRAMES = [
       motorColor: 0x9aa3ab,
       scale: 1,
     },
-    // 0802 motors on 31 mm props: a high, thin mosquito whine.
+    // 0802 motors on 31 mm props: a high, thin mosquito whine.,
     audio: { base: 330, span: 900, idle: 0.10 },
     cameraMount: [0, 0.016, -0.012],
   },
-
-  /* ------------------------------------------------------------------ *
-   * 2. Freestyle — the everyday 5"
-   * ------------------------------------------------------------------ */
   {
     id: 'freestyle',
     displayName: '5" Freestyle',
     className: '250 mm · 650 g · 6S',
     description:
-      'The standard 5-inch quad on 6S. Six-and-a-half to one thrust, honest handling, ~137 km/h flat out. Start here.',
+      'The standard 5-inch quad on 6S. Honest handling, strong punch and around 140 km/h flat out. Start here.',
     accent: 'linear-gradient(160deg, #7fe6b0 0%, #2fae72 55%, #1a6444 100%)',
 
     mass: 0.65,
-    arm: 0.09,                      // 250 mm class
-    body: [0.20, 0.06, 0.20],
-    thrustToWeight: 6.5,            // modern 6S 5": 2207 1960KV peaks near 10:1
-    thrustExponent: 1.85,
-    motorIdle: 0.06,
-    motorTau: 0.022,                  // 2207 on 5" props
-    propDiameterM: 0.127,             // 5" props
-    propPitchM: 0.114,
-    escIdleHz: 38,
-    packResistance: 0.028,            // healthy 6S holds voltage better than 4S
-    yawTorqueCoef: 0.105,
-    tau: 0.028,
-    // Liftoff-style motor power limit: total pack watts. Set ~2x above the
-    // stock full-throttle draw so box-stock setups never clip, but extreme
-    // throttle-curve trims cannot conjure watts the pack cannot give.
-    maxPowerW: 2600,
+    arm: 0.09,
+    body: [0.2, 0.06, 0.2],
+    kv: 1860,
+    rm: 0.07,
+    i0: 1.4,
+    escLimit: 55,
+    tmax: 17.5,
+    propDiameter: 0.1295,
+    propPitch: 0.0914,
+    qRatio: 0.0115,
+    jrot: 6.5e-6,   // fitted: 10–90 % spool ≈ 80 ms
+    rotorDrag: 2.0e-5,
+    cdA: [0.0101, 0.0287, 0.0101],
+    auxCurrent: 0.6,
+    dshotIdle: 0.055,
+    vibration: 40,
+    propHeight: 0.028,
+    battery: { chemistry: 'lipo', cells: 6, label: '6S', mah: 1300, resistance: 0.025 },
 
-    rates: { roll: 800, pitch: 800, yaw: 550 },
-
-    // ~38 m/s (137 km/h) flat out, ~9 m/s flat sink. Typical for a 6S 5".
-    dragLateral: 0.02836,
-    dragVertical: 0.07872,
-    angularDamping: 0.35,
-    windArea: 0.022,
-    maxTilt: 35,
-
-    battery: {
-      cells: 6, label: '6S',
-      FULL: 25.2, LOW: 22.2, CRITICAL: 21.0, CUTOFF: 19.8, EMPTY: 19.4,
-      HOVER_SECONDS: 300, SAG: 1.8,
-      PEAK_CURRENT: 100,      // A, 6S 5" freestyle punch
-      HOVER_CURRENT: 5,       // A in a hover — sips next to the punch
-      CAPACITY_MAH: 1300,     // 6S 1300 mAh — the everyday freestyle pack
+    tune: {
+      pid: {
+        roll: { p: 45, i: 80, d: 30, dMax: 40, f: 120 },
+        pitch: { p: 47, i: 84, d: 34, dMax: 46, f: 125 },
+        yaw: { p: 45, i: 80, d: 0, dMax: 0, f: 120 },
+      },
+      filters: {},
+      rates: actualRates(100, 800, 55),
+      angleLimit: 55,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 38.4,
+    sinkRate: 10.8,
 
     visual: {
       ducted: false,
@@ -234,56 +176,52 @@ const AIRFRAMES = [
       motorColor: 0x8a8d92,
       scale: 1,
     },
-    // 2207 motors on 5" props: the familiar mid-range buzz.
+    // 2207 motors on 5" props: the familiar mid-range buzz.,
     audio: { base: 95, span: 420, idle: 0.07 },
     cameraMount: [0, 0.035, -0.03],
   },
-
-  /* ------------------------------------------------------------------ *
-   * 3. Racer — 6S, 8:1, built for one thing
-   * ------------------------------------------------------------------ */
   {
     id: 'racer',
     displayName: 'Race Quad',
     className: '210 mm · 580 g · 6S',
     description:
-      'Eight-to-one thrust on 6S with 900 deg/s rates and a low-drag tuck. 160 km/h flat out and hover at under a third of the stick. Punishing.',
+      'High-KV 6S race quad with a low-drag tuck and 900 deg/s rates. Hovers low on the stick and never stops accelerating. Punishing.',
     accent: 'linear-gradient(160deg, #ff9d6b 0%, #ff4d4d 50%, #8c1f36 100%)',
 
     mass: 0.58,
-    arm: 0.0742,                    // 210 mm, tighter than the freestyle
-    body: [0.19, 0.05, 0.19],       // lower profile
-    thrustToWeight: 8.0,
-    thrustExponent: 1.95,             // stiff 5" props: thrust climbs steeply
-    motorIdle: 0.07,
-    motorTau: 0.018,                  // high-kV 6S spools fastest
-    propDiameterM: 0.127,             // 5" race props
-    propPitchM: 0.127,                // steep pitch bites harder
-    escIdleHz: 42,
-    packResistance: 0.022,            // low-IR 6S holds voltage under load
-    yawTorqueCoef: 0.115,           // stiffer props bite harder in yaw
-    tau: 0.022,                     // race tune: noticeably sharper
-    maxPowerW: 3600,                // 6S race pack unleashed
+    arm: 0.0742,
+    body: [0.19, 0.05, 0.19],
+    kv: 2100,
+    rm: 0.06,
+    i0: 1.6,
+    escLimit: 60,
+    tmax: 19.0,
+    propDiameter: 0.1295,
+    propPitch: 0.104,
+    qRatio: 0.0125,
+    jrot: 5.1e-6,   // fitted: 10–90 % spool ≈ 80 ms
+    rotorDrag: 1.8e-5,
+    cdA: [0.00367, 0.0182, 0.00367],
+    auxCurrent: 0.6,
+    dshotIdle: 0.055,
+    vibration: 45,
+    propHeight: 0.024,
+    battery: { chemistry: 'lipo', cells: 6, label: '6S', mah: 1100, resistance: 0.022 },
 
-    rates: { roll: 900, pitch: 900, yaw: 650 },
-
-    // Tucked and aerodynamic — a lower coefficient than the freestyle despite
-    // similar size. ~44 m/s (160 km/h), which is a fast 6S race quad; the
-    // 55 m/s the previous tune produced was a dedicated speed-build number.
-    dragLateral: 0.02333,
-    dragVertical: 0.04702,
-    angularDamping: 0.22,           // holds rotation; demands active stopping
-    windArea: 0.019,
-    maxTilt: 45,
-
-    battery: {
-      cells: 6, label: '6S',
-      FULL: 25.2, LOW: 22.2, CRITICAL: 21.0, CUTOFF: 19.8, EMPTY: 19.4,
-      HOVER_SECONDS: 180, SAG: 2.4,
-      PEAK_CURRENT: 120,     // A, 6S race quad on a hard punch-out
-      HOVER_CURRENT: 6,
-      CAPACITY_MAH: 1100,    // 6S 1100 mAh — light race pack, ~2-3 min flat out
+    tune: {
+      pid: {
+        roll: { p: 45, i: 80, d: 30, dMax: 40, f: 120 },
+        pitch: { p: 47, i: 84, d: 34, dMax: 46, f: 125 },
+        yaw: { p: 45, i: 80, d: 0, dMax: 0, f: 120 },
+      },
+      filters: {},
+      rates: actualRates(250, 900, 20),
+      angleLimit: 55,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 46.7,
+    sinkRate: 10.8,
 
     visual: {
       ducted: false,
@@ -293,49 +231,53 @@ const AIRFRAMES = [
       motorColor: 0xb9424a,
       scale: 1,
     },
-    // 6S on stiff props: lower fundamental, far more upper harmonic snarl.
+    // 6S on stiff props: lower fundamental, far more upper harmonic snarl.,
     audio: { base: 78, span: 560, idle: 0.08 },
     cameraMount: [0, 0.030, -0.028],
   },
-
-  /* ------------------------------------------------------------------ *
-   * 4. Toothpick — 3" ultralight
-   * ------------------------------------------------------------------ */
   {
     id: 'toothpick',
     displayName: '3" Toothpick',
-    className: '130 mm · 60 g · 4S',
+    className: '130 mm · 95 g · 4S',
     description:
-      'Featherweight 3-inch. Floaty, efficient, quiet — gaps feel bigger, wind pushes it around.',
+      'Featherweight 3-inch on 4S. Floaty, efficient and quiet — gaps feel bigger, wind pushes it around.',
     accent: 'linear-gradient(160deg, #d3f79b 0%, #5cb85c 55%, #2d6a4f 100%)',
-    mass: 0.06,
+
+    mass: 0.095,
     arm: 0.046,
     body: [0.11, 0.035, 0.11],
-    thrustToWeight: 5.0,
-    thrustExponent: 1.85,
-    motorIdle: 0.06,
-    motorTau: 0.022,
-    propDiameterM: 0.076,
-    propPitchM: 0.06,
-    escIdleHz: 48,
-    packResistance: 0.05,
-    yawTorqueCoef: 0.10,
-    tau: 0.026,
-    maxPowerW: 700,
-    rates: { roll: 750, pitch: 750, yaw: 500 },
-    dragLateral: 0.008,
-    dragVertical: 0.02,
-    angularDamping: 0.3,
-    windArea: 0.01,
-    maxTilt: 35,
-    battery: {
-      cells: 4, label: '4S',
-      FULL: 16.8, LOW: 14.8, CRITICAL: 14.0, CUTOFF: 13.0, EMPTY: 12.8,
-      HOVER_SECONDS: 330, SAG: 1.0,
-      PEAK_CURRENT: 40,
-      HOVER_CURRENT: 3,
-      CAPACITY_MAH: 650,     // 4S 650 mAh — typical 3" pack
+    kv: 5000,
+    rm: 0.25,
+    i0: 0.4,
+    escLimit: 20,
+    tmax: 2.35,
+    propDiameter: 0.0762,
+    propPitch: 0.046,
+    qRatio: 0.0068,
+    jrot: 9.0e-7,
+    rotorDrag: 4.0e-6,
+    cdA: [0.0242, 0.00767, 0.0242],
+    auxCurrent: 0.4,
+    dshotIdle: 0.055,
+    vibration: 35,
+    propHeight: 0.016,
+    battery: { chemistry: 'lipo', cells: 4, label: '4S', mah: 650, resistance: 0.05 },
+
+    tune: {
+      pid: {
+        roll: { p: 70, i: 133, d: 50, dMax: 64, f: 110 },
+        pitch: { p: 75, i: 141, d: 55, dMax: 70, f: 115 },
+        yaw: { p: 70, i: 133, d: 0, dMax: 0, f: 110 },
+      },
+      filters: {},
+      rates: actualRates(150, 800, 45),
+      angleLimit: 55,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 25.2,
+    sinkRate: 7.4,
+
     visual: {
       ducted: false,
       propRadius: 0.038,
@@ -347,45 +289,49 @@ const AIRFRAMES = [
     audio: { base: 180, span: 600, idle: 0.07 },
     cameraMount: [0, 0.028, -0.022],
   },
-
-  /* ------------------------------------------------------------------ *
-   * 5. Freestyle HD — 5.5" heavy freestyle
-   * ------------------------------------------------------------------ */
   {
     id: 'freestyle-hd',
     displayName: '5.5" Freestyle HD',
     className: '270 mm · 720 g · 6S',
     description:
-      'Locked-in 6S freestyle rig with HD camera weight. Planted, smooth, carries momentum through lines.',
+      'Locked-in 5.5\' 6S freestyle rig with HD camera weight. Planted, smooth, carries momentum through lines.',
     accent: 'linear-gradient(160deg, #b79bff 0%, #6d4fd4 55%, #35236e 100%)',
+
     mass: 0.72,
     arm: 0.096,
     body: [0.22, 0.065, 0.22],
-    thrustToWeight: 4.5,
-    thrustExponent: 1.9,
-    motorIdle: 0.06,
-    motorTau: 0.022,
-    propDiameterM: 0.14,
-    propPitchM: 0.10,
-    escIdleHz: 36,
-    packResistance: 0.028,
-    yawTorqueCoef: 0.11,
-    tau: 0.028,
-    maxPowerW: 2900,
-    rates: { roll: 650, pitch: 650, yaw: 450 },
-    dragLateral: 0.028,
-    dragVertical: 0.085,
-    angularDamping: 0.38,
-    windArea: 0.024,
-    maxTilt: 35,
-    battery: {
-      cells: 6, label: '6S',
-      FULL: 25.2, LOW: 22.2, CRITICAL: 21.0, CUTOFF: 19.8, EMPTY: 19.4,
-      HOVER_SECONDS: 280, SAG: 1.8,
-      PEAK_CURRENT: 100,
-      HOVER_CURRENT: 5.5,
-      CAPACITY_MAH: 1300,
+    kv: 1750,
+    rm: 0.07,
+    i0: 1.3,
+    escLimit: 55,
+    tmax: 18.5,
+    propDiameter: 0.1397,
+    propPitch: 0.0889,
+    qRatio: 0.012,
+    jrot: 7.4e-6,   // fitted: 10–90 % spool ≈ 80 ms
+    rotorDrag: 2.2e-5,
+    cdA: [0.0154, 0.029, 0.0154],
+    auxCurrent: 0.8,
+    dshotIdle: 0.055,
+    vibration: 38,
+    propHeight: 0.03,
+    battery: { chemistry: 'lipo', cells: 6, label: '6S', mah: 1300, resistance: 0.025 },
+
+    tune: {
+      pid: {
+        roll: { p: 45, i: 80, d: 30, dMax: 40, f: 120 },
+        pitch: { p: 47, i: 84, d: 34, dMax: 46, f: 125 },
+        yaw: { p: 45, i: 80, d: 0, dMax: 0, f: 120 },
+      },
+      filters: {},
+      rates: actualRates(90, 650, 55),
+      angleLimit: 55,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 36.4,
+    sinkRate: 10.8,
+
     visual: {
       ducted: false,
       propRadius: 0.07,
@@ -397,10 +343,6 @@ const AIRFRAMES = [
     audio: { base: 88, span: 440, idle: 0.07 },
     cameraMount: [0, 0.038, -0.032],
   },
-
-  /* ------------------------------------------------------------------ *
-   * 6. Street League spec racer
-   * ------------------------------------------------------------------ */
   {
     id: 'street-league',
     displayName: 'Street League Spec',
@@ -408,34 +350,42 @@ const AIRFRAMES = [
     description:
       'Spec-class street racer. Even field, predictable grip — precision over raw punch.',
     accent: 'linear-gradient(160deg, #ffd166 0%, #ef476f 55%, #6a1b3a 100%)',
-    mass: 0.60,
+
+    mass: 0.6,
     arm: 0.078,
     body: [0.19, 0.055, 0.19],
-    thrustToWeight: 6.0,
-    thrustExponent: 1.9,
-    motorIdle: 0.065,
-    motorTau: 0.02,
-    propDiameterM: 0.127,
-    propPitchM: 0.114,
-    escIdleHz: 40,
-    packResistance: 0.026,
-    yawTorqueCoef: 0.11,
-    tau: 0.024,
-    maxPowerW: 3100,
-    rates: { roll: 800, pitch: 800, yaw: 550 },
-    dragLateral: 0.024,
-    dragVertical: 0.055,
-    angularDamping: 0.28,
-    windArea: 0.02,
-    maxTilt: 40,
-    battery: {
-      cells: 6, label: '6S',
-      FULL: 25.2, LOW: 22.2, CRITICAL: 21.0, CUTOFF: 19.8, EMPTY: 19.4,
-      HOVER_SECONDS: 200, SAG: 2.0,
-      PEAK_CURRENT: 110,
-      HOVER_CURRENT: 5,
-      CAPACITY_MAH: 1100,
+    kv: 1950,
+    rm: 0.07,
+    i0: 1.4,
+    escLimit: 55,
+    tmax: 17.0,
+    propDiameter: 0.1295,
+    propPitch: 0.0914,
+    qRatio: 0.0115,
+    jrot: 5.9e-6,   // fitted: 10–90 % spool ≈ 80 ms
+    rotorDrag: 1.9e-5,
+    cdA: [0.034, 0.0228, 0.034],
+    auxCurrent: 0.6,
+    dshotIdle: 0.055,
+    vibration: 40,
+    propHeight: 0.026,
+    battery: { chemistry: 'lipo', cells: 6, label: '6S', mah: 1100, resistance: 0.024 },
+
+    tune: {
+      pid: {
+        roll: { p: 45, i: 80, d: 30, dMax: 40, f: 120 },
+        pitch: { p: 47, i: 84, d: 34, dMax: 46, f: 125 },
+        yaw: { p: 45, i: 80, d: 0, dMax: 0, f: 120 },
+      },
+      filters: {},
+      rates: actualRates(150, 800, 45),
+      angleLimit: 55,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 39.7,
+    sinkRate: 10.8,
+
     visual: {
       ducted: false,
       propRadius: 0.0635,
@@ -447,45 +397,49 @@ const AIRFRAMES = [
     audio: { base: 82, span: 520, idle: 0.08 },
     cameraMount: [0, 0.031, -0.029],
   },
-
-  /* ------------------------------------------------------------------ *
-   * 7. Mega / Beast — 7" long range
-   * ------------------------------------------------------------------ */
   {
     id: 'mega',
     displayName: '7" Beast',
-    className: '320 mm · 950 g · 6S',
+    className: '320 mm · 950 g · 6S2P Li-ion',
     description:
-      'Seven-inch cruiser. Huge props, high top speed, slow spool — dives for days, turns like a bus.',
+      'Seven-inch long-range cruiser on a Li-ion pack. Huge props, slow spool — dives for days, turns like a bus.',
     accent: 'linear-gradient(160deg, #9adcff 0%, #3a86ff 55%, #1b2a6b 100%)',
+
     mass: 0.95,
     arm: 0.113,
     body: [0.26, 0.07, 0.26],
-    thrustToWeight: 3.0,
-    thrustExponent: 1.8,
-    motorIdle: 0.055,
-    motorTau: 0.032,
-    propDiameterM: 0.178,
-    propPitchM: 0.127,
-    escIdleHz: 30,
-    packResistance: 0.03,
-    yawTorqueCoef: 0.10,
-    tau: 0.034,
-    maxPowerW: 2300,               // big props sip current at cruise
-    rates: { roll: 500, pitch: 500, yaw: 350 },
-    dragLateral: 0.035,
-    dragVertical: 0.10,
-    angularDamping: 0.42,
-    windArea: 0.03,
-    maxTilt: 30,
-    battery: {
-      cells: 6, label: '6S',
-      FULL: 25.2, LOW: 22.2, CRITICAL: 21.0, CUTOFF: 19.8, EMPTY: 19.4,
-      HOVER_SECONDS: 600, SAG: 1.2,   // 10 min Li-Ion cruise — long-range territory
-      PEAK_CURRENT: 80,
-      HOVER_CURRENT: 5,      // big props loaf — the whole point of 7"
-      CAPACITY_MAH: 4000,    // 6S2P 21700 Li-Ion — the long-range brick
+    kv: 1300,
+    rm: 0.065,
+    i0: 1.0,
+    escLimit: 55,
+    tmax: 21.0,
+    propDiameter: 0.178,
+    propPitch: 0.089,
+    qRatio: 0.016,
+    jrot: 2.3e-5,
+    rotorDrag: 3.2e-5,
+    cdA: [0.00441, 0.0293, 0.00441],
+    auxCurrent: 0.8,
+    dshotIdle: 0.05,
+    vibration: 30,
+    propHeight: 0.034,
+    battery: { chemistry: 'liion', cells: 6, label: '6S2P', mah: 4000, resistance: 0.045 },
+
+    tune: {
+      pid: {
+        roll: { p: 42, i: 80, d: 34, dMax: 42, f: 100 },
+        pitch: { p: 44, i: 84, d: 38, dMax: 48, f: 105 },
+        yaw: { p: 40, i: 80, d: 0, dMax: 0, f: 100 },
+      },
+      filters: { dtermLpf1Min: 60, dtermLpf1Max: 120, dtermLpf2: 120 },
+      rates: actualRates(70, 500, 50),
+      angleLimit: 55,
     },
+
+    // Measured by tests/fit-aero.mjs: full-stick acro top speed, idle sink (m/s).
+    topSpeed: 35.6,
+    sinkRate: 10.3,
+
     visual: {
       ducted: false,
       propRadius: 0.089,
@@ -510,10 +464,6 @@ const AIRFRAMES = [
  *     I_xx = m/12 · (h² + d²)     (pitch axis)
  *     I_yy = m/12 · (w² + d²)     (yaw axis)
  *     I_zz = m/12 · (w² + h²)     (roll axis)
- *
- * These must agree with cannon's, or every derived gain is wrong by whatever
- * the discrepancy is. `tests/flight-model.test.mjs` asserts the agreement
- * against a real body's inertia tensor rather than trusting this comment.
  */
 export function boxInertia(mass, [w, h, d]) {
   const k = mass / 12;
@@ -524,106 +474,64 @@ export function boxInertia(mass, [w, h, d]) {
   };
 }
 
+/** Per-cell thresholds on the rested (open-circuit) voltage. */
+const CELL_LOW = 3.5;
+const CELL_CRITICAL = 3.3;
+const CELL_CUTOFF = 3.0;
+
 /**
- * Expand a raw airframe description into everything the flight model needs.
- * Pure and deterministic, so it can be unit-tested without a physics world.
+ * Expand a raw airframe into everything the physics and UI need.
+ * Pure and deterministic. Throws if the motor cannot reach Tmax on its pack.
  */
 export function derive(raw) {
-  const spec = { ...raw };
+  const spec = { ...raw, battery: { ...raw.battery } };
+  const g = 9.81;
+  spec.weight = spec.mass * g;
+  spec.inertia = boxInertia(spec.mass, spec.body);
 
-  const weight = spec.mass * 9.81;
-  spec.weight = weight;
-
-  // Static thrust available from one motor at full command.
-  spec.motorMaxThrust = (weight * spec.thrustToWeight) / 4;
-  spec.maxThrustTotal = spec.motorMaxThrust * 4;
-
-  // Reference full-throttle RPM for the audio engine. Scales with specific
-  // thrust (TWR) and inversely with disc size: small high-kV motors spin far
-  // faster than 5" motors at the same load. Deterministic, audio-only.
-  spec.motorMaxRPM = Math.round(
-    12000 + 2200 * spec.thrustToWeight * (0.127 / spec.propDiameterM),
-  );
-  // Parasite-drag area backing translational-lift/induced-drag terms.
-  // Solved from the tuned lateral coefficient so top speed is unchanged.
-  spec.discArea = Math.PI * (spec.propDiameterM / 2) ** 2;
-  spec.cda = (spec.dragLateral * 2) / 1.225;
-  // Motor power limit (Liftoff-style): total pack watts. Falls back to a
-  // generous thrust-based estimate so a spec without the field never clips.
-  if (!Number.isFinite(spec.maxPowerW)) {
-    spec.maxPowerW = spec.maxThrustTotal * 60;
+  const { kvRad, Kt } = motorConstants(spec.kv);
+  const V = spec.battery.cells * 3.9;
+  const omegaMax = kvRad * (V - spec.rm * (spec.qRatio * spec.tmax / Kt + spec.i0));
+  if (!(omegaMax > 0)) {
+    throw new Error(`[DroneTypes] ${spec.id}: motor cannot reach Tmax (ωmax=${omegaMax})`);
   }
-  /* --- hover ---------------------------------------------------------- *
-   * Invert the thrust curve. `motorHover` is the per-motor *command* that
-   * balances weight; `hoverThrottle` is the stick position that produces it
-   * once the idle offset is folded back in.
-   */
-  const thrustFraction = weight / spec.maxThrustTotal;          // 1 / TWR
-  spec.motorHover = Math.pow(thrustFraction, 1 / spec.thrustExponent);
-  spec.hoverThrottle = clamp01(
-    (spec.motorHover - spec.motorIdle) / (1 - spec.motorIdle),
-  );
+  spec.kT = spec.tmax / (omegaMax * omegaMax);
+  spec.kQ = spec.qRatio * spec.kT;
 
-  /* --- inertia and authority ------------------------------------------ */
-  const I = boxInertia(spec.mass, spec.body);
-  spec.inertia = I;
+  // Refine: the fixed 3.9 V/cell is only an estimate of the loaded pack. Make
+  // `tmax` exactly the static thrust at full duty on a fresh pack by solving
+  // the steady-state bus (the real sag of this pack's R0 at this current).
+  let w = omegaMax;
+  for (let k = 0; k < 40; k++) {
+    w = steadyState(spec, 1, 1).omega;
+    spec.kT = spec.tmax / (w * w);
+    spec.kQ = spec.qRatio * spec.kT;
+  }
+  spec.omegaMax = w;
+  spec.motorRpmMax = w * 60 / (2 * Math.PI);
+  spec.maxThrustTotal = 4 * spec.tmax;
+  spec.thrustToWeight = spec.maxThrustTotal / spec.weight;
 
-  // Air-mode halving: a saturated pitch command gives motors [0, 0, 1, 1].
-  const pitchTorque = 2 * spec.arm * spec.motorMaxThrust;
-  const rollTorque = 2 * spec.arm * spec.motorMaxThrust;
-  spec.yawTorque = spec.yawTorqueCoef * 4 * spec.motorMaxThrust * spec.arm;
+  // Battery read-outs on the rested voltage, per chemistry and cell count.
+  const b = spec.battery;
+  const cells = b.cells;
+  b.FULL = cellOcv(b.chemistry, 1) * cells;
+  b.EMPTY = cellOcv(b.chemistry, 0) * cells;
+  b.LOW = CELL_LOW * cells;
+  b.CRITICAL = CELL_CRITICAL * cells;
+  b.CUTOFF = CELL_CUTOFF * cells;
+  b.CAPACITY_MAH = b.mah;
 
-  spec.alphaMax = {
-    pitch: pitchTorque / I.x,
-    roll: rollTorque / I.z,
-    yaw: spec.yawTorque / I.y,
-  };
-
-  /* --- gains ----------------------------------------------------------- */
-  const gain = (alpha, tau) => 1 / (tau * alpha);
-
-  const kpRoll = gain(spec.alphaMax.roll, spec.tau);
-  const kpPitch = gain(spec.alphaMax.pitch, spec.tau);
-  const kpYaw = gain(spec.alphaMax.yaw, YAW_TAU);
-
-  spec.pid = {
-    roll: {
-      p: kpRoll,
-      i: kpRoll / INTEGRAL_TIME,
-      // Constant Kd · alphaMax — see the header note on why this is not Kp-scaled.
-      d: D_AUTHORITY / spec.alphaMax.roll,
-    },
-    pitch: {
-      p: kpPitch,
-      i: kpPitch / INTEGRAL_TIME,
-      d: D_AUTHORITY / spec.alphaMax.pitch,
-    },
-    yaw: {
-      p: kpYaw,
-      i: kpYaw / YAW_INTEGRAL_TIME,
-      d: 0,
-    },
-  };
-
-  /* --- derived read-outs for the UI ------------------------------------ */
-  // Terminal speed at maximum sustainable tilt: the quad must still hold its
-  // own weight, so cos(tilt) = 1/TWR and the surplus goes sideways.
-  const horizontal = weight * Math.sqrt(Math.max(spec.thrustToWeight ** 2 - 1, 0));
-  spec.topSpeed = Math.sqrt(horizontal / spec.dragLateral);
-
-  // Angle mode caps the lean, so it caps the speed well below the acro figure.
-  // Worth surfacing separately: it is the number a beginner actually meets, and
-  // on the whoop it is the difference between 7 m/s and a walking pace.
-  const angleHorizontal = weight * Math.tan(spec.maxTilt * Math.PI / 180);
-  spec.angleTopSpeed = Math.sqrt(angleHorizontal / spec.dragLateral);
-
-  // Steady-state climb rate at full throttle, where excess thrust balances the
-  // prop disc's drag.
-  spec.climbRate = Math.sqrt(
-    Math.max(spec.maxThrustTotal - weight, 0) / spec.dragVertical,
-  );
-  // ...and the sink rate with the motors cut.
-  spec.sinkRate = Math.sqrt(weight / spec.dragVertical);
+  // Hover: the duty at which four motors, fresh pack, zero airspeed, lift
+  // the weight — then as FC throttle above the idle floor.
+  let lo = 0;
+  let hi = 1;
+  for (let k = 0; k < 60; k++) {
+    const mid = 0.5 * (lo + hi);
+    if (4 * steadyState(spec, mid, 1).thrust > spec.weight) hi = mid; else lo = mid;
+  }
+  spec.hoverDuty = 0.5 * (lo + hi);
+  spec.hoverThrottle = clamp01((spec.hoverDuty - spec.dshotIdle) / (1 - spec.dshotIdle));
 
   return spec;
 }
@@ -650,15 +558,15 @@ export function listAirframes() {
 
 /** Short spec lines for the selection card. */
 export function airframeStats(spec) {
-  const cap = spec.battery.CAPACITY_MAH;
+  const r = spec.tune.rates;
   return [
     ['Class', spec.className],
     ['Thrust', `${spec.thrustToWeight.toFixed(1)}:1`],
-    ['Top speed', `${Math.round(spec.topSpeed)} m/s acro · ${Math.round(spec.angleTopSpeed)} angle`],
-    ['Climb', `${spec.climbRate.toFixed(1)} m/s`],
-    ['Rates', `${spec.rates.roll} / ${spec.rates.yaw} deg/s`],
+    ['Top speed', `${Math.round(spec.topSpeed)} m/s (${Math.round(spec.topSpeed * 3.6)} km/h)`],
+    ['Motor', `${spec.kv} KV · ${Math.round(spec.motorRpmMax / 1000)}k RPM`],
+    ['Rates', `${r.rates[0] * 10} / ${r.rates[2] * 10} deg/s`],
     ['Hover', `${Math.round(spec.hoverThrottle * 100)}% throttle`],
-    ['Pack', Number.isFinite(cap) ? `${spec.battery.label} ${cap}mAh` : spec.battery.label],
+    ['Pack', `${spec.battery.label} ${spec.battery.mah}mAh`],
   ];
 }
 

@@ -19,7 +19,7 @@
  * fiddly stay readable that way.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import {
   plasterTexture, woodPlankTexture, tileTexture, fabricTexture,

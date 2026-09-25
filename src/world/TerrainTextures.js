@@ -17,7 +17,7 @@
  * terrain shader falls back to flat colours.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { makeRng } from '../assets/procedural.js';
 
 /* ========================================================================== *

@@ -31,8 +31,15 @@
  * compiles are all wrapped; a failure leaves the scene lit by the plain lights.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import {
+  Fn, If, float, vec2, vec3, vec4, uniform, varying,
+  acos, clamp, cos, dot, exp, floor, fract, max, mix, normalize, pow, smoothstep,
+  cameraPosition, modelViewProjection, positionWorld, property,
+} from 'three/tsl';
+import { CSMShadowNode } from 'three/examples/jsm/csm/CSMShadowNode.js';
 import { activeQuality } from './Quality.js';
+import { sunState } from './SunState.js';
 
 const DEG = Math.PI / 180;
 
@@ -58,198 +65,213 @@ const OUTDOOR_DEFAULTS = {
 };
 
 /* ========================================================================== *
- * Sky shader
+ * Sky material (TSL)
  * ========================================================================== */
 
 /**
- * Preetham sky, adapted from three's Sky.SkyShader with three changes:
+ * Preetham sky, adapted from three's Sky shader with three changes:
  *   - the lower hemisphere fades into a ground colour instead of repeating the
  *     horizon, so the environment map has a believable bounce term;
  *   - clouds are lit relative to the sky's own brightness (computed once in
  *     the vertex stage), which keeps them white at noon and pink at dusk;
  *   - clouds self-shadow with a second sample offset toward the sun.
+ *
+ * This is a line-for-line TSL port of the original GLSL (three's SkyMesh is
+ * the reference for the node idioms). Every former uniform is a `uniform()`
+ * node under the same name in `material.uniforms`, so the update sites below
+ * (`u.turbidity.value = …`) are unchanged. Values that the GLSL computed in
+ * the vertex stage stay there, through `varying()`.
  */
-const SKY_SHADER = {
-  uniforms: {
-    turbidity: { value: 3 },
-    rayleigh: { value: 1.2 },
-    mieCoefficient: { value: 0.005 },
-    mieDirectionalG: { value: 0.8 },
-    sunPosition: { value: new THREE.Vector3(0, 1, 0) },
-    up: { value: new THREE.Vector3(0, 1, 0) },
-    uGround: { value: new THREE.Color(0x2c3322) },
-    uCloudCover: { value: 0.3 },
-    uCloudDensity: { value: 0.6 },
-    uCloudScale: { value: 1.0 },
-    uTime: { value: 0 },
-    uShowSun: { value: 1 },
-  },
-  vertexShader: /* glsl */`
-    uniform vec3 sunPosition;
-    uniform float rayleigh;
-    uniform float turbidity;
-    uniform float mieCoefficient;
-    uniform float mieDirectionalG;
-    uniform vec3 up;
+function createSkyMaterial() {
+  const U = {
+    turbidity: uniform(3),
+    rayleigh: uniform(1.2),
+    mieCoefficient: uniform(0.005),
+    mieDirectionalG: uniform(0.8),
+    sunPosition: uniform(new THREE.Vector3(0, 1, 0)),
+    up: uniform(new THREE.Vector3(0, 1, 0)),
+    uGround: uniform(new THREE.Color(0x2c3322)),
+    uCloudCover: uniform(0.3),
+    uCloudDensity: uniform(0.6),
+    uCloudScale: uniform(1.0),
+    uTime: uniform(0),
+    uShowSun: uniform(1),
+  };
 
-    varying vec3 vWorldPosition;
-    varying vec3 vSunDirection;
-    varying vec3 vBetaR;
-    varying vec3 vBetaM;
-    varying float vSunE;
-    varying vec3 vSkyRef;
-    varying vec3 vSunTint;
+  const pi = float(3.141592653589793);
+  const e = float(2.718281828459045);
+  const totalRayleigh = vec3(5.804542996261093E-6, 1.3562911419845635E-5, 3.0265902468824876E-5);
+  const MieConst = vec3(1.8399918514433978E14, 2.7798023919660528E14, 4.0790479543861094E14);
+  const cutoffAngle = float(1.6110731556870734);
+  const steepness = float(1.5);
+  const EE = float(1000.0);
 
-    const float e = 2.718281828459045;
-    const float pi = 3.141592653589793;
-    const vec3 totalRayleigh = vec3(5.804542996261093E-6, 1.3562911419845635E-5, 3.0265902468824876E-5);
-    const vec3 MieConst = vec3(1.8399918514433978E14, 2.7798023919660528E14, 4.0790479543861094E14);
-    const float cutoffAngle = 1.6110731556870734;
-    const float steepness = 1.5;
-    const float EE = 1000.0;
+  const sunIntensity = (zenithAngleCos) => {
+    const z = clamp(zenithAngleCos, -1.0, 1.0);
+    return EE.mul(max(0.0, float(1.0).sub(pow(e, cutoffAngle.sub(acos(z)).div(steepness).negate()))));
+  };
+  const totalMie = (T) => {
+    const c = float(0.2).mul(T).mul(10E-18);
+    return float(0.434).mul(c).mul(MieConst);
+  };
+  const rayleighPhase = (cosTheta) => float(0.05968310365946075).mul(float(1.0).add(cosTheta.mul(cosTheta)));
+  const hgPhase = (cosTheta, g) => {
+    const g2 = g.mul(g);
+    return float(0.07957747154594767).mul(float(1.0).sub(g2).div(pow(float(1.0).sub(float(2.0).mul(g).mul(cosTheta)).add(g2), 1.5)));
+  };
+  /** Optical-length factor for a zenith angle (the GLSL `inverse`). */
+  const opticalInverse = (zenithAngle) => float(1.0).div(
+    cos(zenithAngle).add(float(0.15).mul(pow(float(93.885).sub(zenithAngle.mul(180.0).div(pi)), -1.253))),
+  );
 
-    float sunIntensity(float zenithAngleCos) {
-      zenithAngleCos = clamp(zenithAngleCos, -1.0, 1.0);
-      return EE * max(0.0, 1.0 - pow(e, -((cutoffAngle - acos(zenithAngleCos)) / steepness)));
+  /* ---- vertex stage (per-draw constants, carried as varyings) ---- */
+  const sunDirV = normalize(U.sunPosition);
+  const betaRV = totalRayleigh.mul(U.rayleigh);
+  const betaMV = totalMie(U.turbidity).mul(U.mieCoefficient);
+  const sunEV = sunIntensity(dot(sunDirV, U.up));
+
+  const skyAt = (direction) => {
+    const zenithAngle = acos(max(0.0, dot(U.up, direction)));
+    const inv = opticalInverse(zenithAngle);
+    const Fex = exp(betaRV.mul(8.4E3).mul(inv).add(betaMV.mul(1.25E3).mul(inv)).negate());
+    const cosTheta = dot(direction, sunDirV);
+    const bR = betaRV.mul(rayleighPhase(cosTheta.mul(0.5).add(0.5)));
+    const bM = betaMV.mul(hgPhase(cosTheta, U.mieDirectionalG));
+    const ratio = bR.add(bM).div(betaRV.add(betaMV));
+    const Lin = pow(sunEV.mul(ratio).mul(float(1.0).sub(Fex)), vec3(1.5)).mul(
+      mix(vec3(1.0), pow(sunEV.mul(ratio).mul(Fex), vec3(0.5)), clamp(pow(float(1.0).sub(dot(U.up, sunDirV)), 5.0), 0.0, 1.0)),
+    );
+    return Lin.add(vec3(0.1).mul(Fex)).mul(0.04);
+  };
+
+  // Reference brightness for cloud lighting: the sky 30 degrees up, facing
+  // away from the sun. Same for every vertex; costs nothing.
+  const away = normalize(vec3(sunDirV.x.negate(), 0.0, sunDirV.z.negate()).add(vec3(0.0, 0.58, 0.0)));
+  const za = acos(max(0.0, dot(U.up, sunDirV)));
+  const invSun = opticalInverse(za);
+
+  const vSunDirection = varying(sunDirV, 'vSunDirection');
+  const vBetaR = varying(betaRV, 'vBetaR');
+  const vBetaM = varying(betaMV, 'vBetaM');
+  const vSunE = varying(sunEV, 'vSunE');
+  const vSkyRef = varying(skyAt(away), 'vSkyRef');
+  // Sun transmittance tint for cloud tops.
+  const vSunTint = varying(exp(betaRV.mul(8.4E3).mul(invSun).add(betaMV.mul(1.25E3).mul(invSun)).negate()), 'vSunTint');
+
+  /* ---- fragment stage ---- */
+  const h12 = (p) => {
+    const p3 = fract(vec3(p.x, p.y, p.x).mul(0.1031)).toVar();
+    p3.addAssign(dot(p3, p3.yzx.add(33.33)));
+    return fract(p3.x.add(p3.y).mul(p3.z));
+  };
+  const vnoise = Fn(([pIn]) => {
+    const p = vec2(pIn);
+    const i = floor(p);
+    const f = fract(p);
+    const u = f.mul(f).mul(float(3.0).sub(f.mul(2.0)));
+    return mix(
+      mix(h12(i), h12(i.add(vec2(1, 0))), u.x),
+      mix(h12(i.add(vec2(0, 1))), h12(i.add(vec2(1, 1))), u.x),
+      u.y,
+    );
+  });
+  // mat2(0.8, -0.6, 0.6, 0.8) * p, written out (GLSL matrices are column-major).
+  const rot = (p) => vec2(p.x.mul(0.8).add(p.y.mul(0.6)), p.x.mul(-0.6).add(p.y.mul(0.8)));
+  const cfbm = Fn(([pIn]) => {
+    const p = vec2(pIn).toVar();
+    const v = float(0.0).toVar();
+    let a = 0.5;
+    for (let i = 0; i < 5; i++) {
+      v.addAssign(vnoise(p).mul(a));
+      p.assign(rot(p).mul(2.02));
+      a *= 0.5;
     }
-    vec3 totalMie(float T) {
-      float c = (0.2 * T) * 10E-18;
-      return 0.434 * c * MieConst;
-    }
-    float rayleighPhaseV(float cosTheta) { return 0.05968310365946075 * (1.0 + cosTheta * cosTheta); }
-    float hgPhaseV(float cosTheta, float g) {
-      float g2 = g * g;
-      return 0.07957747154594767 * ((1.0 - g2) / pow(1.0 - 2.0 * g * cosTheta + g2, 1.5));
-    }
-    vec3 skyAt(vec3 direction) {
-      float zenithAngle = acos(max(0.0, dot(up, direction)));
-      float inverse = 1.0 / (cos(zenithAngle) + 0.15 * pow(93.885 - ((zenithAngle * 180.0) / pi), -1.253));
-      vec3 Fex = exp(-(vBetaR * 8.4E3 * inverse + vBetaM * 1.25E3 * inverse));
-      float cosTheta = dot(direction, vSunDirection);
-      vec3 bR = vBetaR * rayleighPhaseV(cosTheta * 0.5 + 0.5);
-      vec3 bM = vBetaM * hgPhaseV(cosTheta, mieDirectionalG);
-      vec3 ratio = (bR + bM) / (vBetaR + vBetaM);
-      vec3 Lin = pow(vSunE * ratio * (1.0 - Fex), vec3(1.5));
-      Lin *= mix(vec3(1.0), pow(vSunE * ratio * Fex, vec3(0.5)), clamp(pow(1.0 - dot(up, vSunDirection), 5.0), 0.0, 1.0));
-      return (Lin + vec3(0.1) * Fex) * 0.04;
-    }
+    return v;
+  });
 
-    void main() {
-      vec4 worldPosition = modelMatrix * vec4(position, 1.0);
-      vWorldPosition = worldPosition.xyz;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      gl_Position.z = gl_Position.w;
+  // The sun disc's radiance, written by the colour stage and read back as
+  // the emissive term (see below).
+  const skySun = property('vec3', 'fpvSkySun');
 
-      vSunDirection = normalize(sunPosition);
-      vSunE = sunIntensity(dot(vSunDirection, up));
-      vBetaR = totalRayleigh * rayleigh;
-      vBetaM = totalMie(turbidity) * mieCoefficient;
+  const colorNode = Fn(() => {
+    const direction = normalize(positionWorld.sub(cameraPosition));
 
-      // Reference brightness for cloud lighting: the sky 30 degrees up, facing
-      // away from the sun. Same for every vertex; costs nothing.
-      vec3 away = normalize(vec3(-vSunDirection.x, 0.0, -vSunDirection.z) + vec3(0.0, 0.58, 0.0));
-      vSkyRef = skyAt(away);
-      // Sun transmittance tint for cloud tops.
-      float za = acos(max(0.0, dot(up, vSunDirection)));
-      float inv = 1.0 / (cos(za) + 0.15 * pow(93.885 - ((za * 180.0) / pi), -1.253));
-      vSunTint = exp(-(vBetaR * 8.4E3 * inv + vBetaM * 1.25E3 * inv));
-    }
-  `,
-  fragmentShader: /* glsl */`
-    varying vec3 vWorldPosition;
-    varying vec3 vSunDirection;
-    varying vec3 vBetaR;
-    varying vec3 vBetaM;
-    varying float vSunE;
-    varying vec3 vSkyRef;
-    varying vec3 vSunTint;
+    const zenithAngle = acos(max(0.0, dot(U.up, direction)));
+    const inverse = opticalInverse(zenithAngle);
+    const Fex = exp(vBetaR.mul(8.4E3).mul(inverse).add(vBetaM.mul(1.25E3).mul(inverse)).negate());
 
-    uniform float mieDirectionalG;
-    uniform vec3 up;
-    uniform vec3 uGround;
-    uniform float uCloudCover;
-    uniform float uCloudDensity;
-    uniform float uCloudScale;
-    uniform float uTime;
-    uniform float uShowSun;
+    const cosTheta = dot(direction, vSunDirection);
+    const betaRTheta = vBetaR.mul(rayleighPhase(cosTheta.mul(0.5).add(0.5)));
+    const betaMTheta = vBetaM.mul(hgPhase(cosTheta, U.mieDirectionalG));
+    const ratio = betaRTheta.add(betaMTheta).div(vBetaR.add(vBetaM));
 
-    const float pi = 3.141592653589793;
-    const float sunAngularDiameterCos = 0.99995;
+    const Lin = pow(vSunE.mul(ratio).mul(float(1.0).sub(Fex)), vec3(1.5)).mul(
+      mix(vec3(1.0), pow(vSunE.mul(ratio).mul(Fex), vec3(0.5)), clamp(pow(float(1.0).sub(dot(U.up, vSunDirection)), 5.0), 0.0, 1.0)),
+    );
 
-    float rayleighPhase(float cosTheta) { return 0.05968310365946075 * (1.0 + cosTheta * cosTheta); }
-    float hgPhase(float cosTheta, float g) {
-      float g2 = g * g;
-      return 0.07957747154594767 * ((1.0 - g2) / pow(1.0 - 2.0 * g * cosTheta + g2, 1.5));
-    }
+    const sunAngularDiameterCos = float(0.99995);
+    const sundisc = smoothstep(sunAngularDiameterCos, sunAngularDiameterCos.add(0.00002), cosTheta).mul(U.uShowSun);
+    const L0 = vec3(0.1).mul(Fex);
+    // The sun disc is carried separately as the material's emissive (below),
+    // so the post pipeline's bloom target sees the sun and not the sky. The
+    // sum colour + emissive is the GLSL's (Lin + L0 + disc) * 0.04.
+    const sun = vSunE.mul(19000.0).mul(Fex).mul(sundisc).mul(0.04).toVar();
 
-    float h12(vec2 p) {
-      vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-      p3 += dot(p3, p3.yzx + 33.33);
-      return fract((p3.x + p3.y) * p3.z);
-    }
-    float vnoise(vec2 p) {
-      vec2 i = floor(p); vec2 f = fract(p);
-      vec2 u = f * f * (3.0 - 2.0 * f);
-      return mix(mix(h12(i), h12(i + vec2(1, 0)), u.x), mix(h12(i + vec2(0, 1)), h12(i + vec2(1, 1)), u.x), u.y);
-    }
-    float cfbm(vec2 p) {
-      float v = 0.0; float a = 0.5;
-      mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
-      for (int i = 0; i < 5; i++) { v += a * vnoise(p); p = r * p * 2.02; a *= 0.5; }
-      return v;
-    }
+    const col = Lin.add(L0).mul(0.04).add(vec3(0.0, 0.0003, 0.00075)).toVar();
 
-    void main() {
-      vec3 direction = normalize(vWorldPosition - cameraPosition);
-
-      float zenithAngle = acos(max(0.0, dot(up, direction)));
-      float inverse = 1.0 / (cos(zenithAngle) + 0.15 * pow(93.885 - ((zenithAngle * 180.0) / pi), -1.253));
-      vec3 Fex = exp(-(vBetaR * 8.4E3 * inverse + vBetaM * 1.25E3 * inverse));
-
-      float cosTheta = dot(direction, vSunDirection);
-      vec3 betaRTheta = vBetaR * rayleighPhase(cosTheta * 0.5 + 0.5);
-      vec3 betaMTheta = vBetaM * hgPhase(cosTheta, mieDirectionalG);
-      vec3 ratio = (betaRTheta + betaMTheta) / (vBetaR + vBetaM);
-
-      vec3 Lin = pow(vSunE * ratio * (1.0 - Fex), vec3(1.5));
-      Lin *= mix(vec3(1.0), pow(vSunE * ratio * Fex, vec3(0.5)), clamp(pow(1.0 - dot(up, vSunDirection), 5.0), 0.0, 1.0));
-
-      vec3 L0 = vec3(0.1) * Fex;
-      float sundisc = smoothstep(sunAngularDiameterCos, sunAngularDiameterCos + 0.00002, cosTheta) * uShowSun;
-      L0 += (vSunE * 19000.0 * Fex) * sundisc;
-
-      vec3 col = (Lin + L0) * 0.04 + vec3(0.0, 0.0003, 0.00075);
-
-      // Clouds: one layer projected onto a plane, horizon-compressed.
-      if (direction.y > 0.0 && uCloudCover > 0.001) {
-        vec2 uv = direction.xz / (direction.y + 0.14) * 1.6 * uCloudScale;
-        uv += vec2(uTime * 0.0045, uTime * 0.0016);
-        vec2 warp = vec2(cfbm(uv * 0.7 + 3.1), cfbm(uv * 0.7 - 1.7));
-        float n = cfbm(uv + warp * 0.6);
-        float cover = smoothstep(1.0 - uCloudCover - 0.02, 1.0 - uCloudCover + 0.32, n);
-        // Self-shadowing: denser cloud between this point and the sun darkens it.
-        float nSun = cfbm(uv + warp * 0.6 + normalize(vSunDirection.xz + 1e-4) * 0.09);
-        float shade = clamp(0.62 + (n - nSun) * 4.0, 0.25, 1.15);
-        float lum = dot(vSkyRef, vec3(0.2126, 0.7152, 0.0722));
-        vec3 sunLit = vSunTint / max(max(vSunTint.r, max(vSunTint.g, vSunTint.b)), 1e-4);
-        vec3 cloudCol = lum * 2.6 * mix(vec3(0.62, 0.66, 0.74), sunLit * 1.12, shade);
+    // Clouds: one layer projected onto a plane, horizon-compressed.
+    If(direction.y.greaterThan(0.0).and(U.uCloudCover.greaterThan(0.001)), () => {
+      const uv = direction.xz.div(direction.y.add(0.14)).mul(1.6).mul(U.uCloudScale)
+        .add(vec2(U.uTime.mul(0.0045), U.uTime.mul(0.0016))).toVar();
+      const warp = vec2(cfbm(uv.mul(0.7).add(3.1)), cfbm(uv.mul(0.7).sub(1.7)));
+      const n = cfbm(uv.add(warp.mul(0.6)));
+      const cover = smoothstep(float(1.0).sub(U.uCloudCover).sub(0.02), float(1.0).sub(U.uCloudCover).add(0.32), n);
+      // Self-shadowing: denser cloud between this point and the sun darkens it.
+      const nSun = cfbm(uv.add(warp.mul(0.6)).add(normalize(vSunDirection.xz.add(1e-4)).mul(0.09)));
+      const shade = clamp(float(0.62).add(n.sub(nSun).mul(4.0)), 0.25, 1.15);
+      const lum = dot(vSkyRef, vec3(0.2126, 0.7152, 0.0722));
+      const sunLit = vSunTint.div(max(max(vSunTint.r, max(vSunTint.g, vSunTint.b)), 1e-4));
+      const cloudCol = lum.mul(2.6).mul(mix(vec3(0.62, 0.66, 0.74), sunLit.mul(1.12), shade))
         // Forward-scatter glow around the sun.
-        cloudCol += lum * 1.4 * sunLit * pow(max(cosTheta, 0.0), 12.0) * (1.0 - cover * 0.5);
-        float fade = smoothstep(0.0, 0.16, direction.y);
-        col = mix(col, cloudCol, cover * uCloudDensity * fade);
-      }
+        .add(lum.mul(1.4).mul(sunLit).mul(pow(max(cosTheta, 0.0), 12.0)).mul(float(1.0).sub(cover.mul(0.5))));
+      const fade = smoothstep(0.0, 0.16, direction.y);
+      const cloudMix = cover.mul(U.uCloudDensity).mul(fade);
+      col.assign(mix(col, cloudCol, cloudMix));
+      sun.mulAssign(float(1.0).sub(cloudMix));
+    });
 
-      // Below the horizon: fade to a lit ground colour (bounce light for IBL).
-      float below = smoothstep(0.0, -0.06, direction.y);
-      float groundLight = dot(vSkyRef, vec3(0.2126, 0.7152, 0.0722)) * 1.6 * (0.35 + 0.65 * clamp(vSunDirection.y * 2.0, 0.0, 1.0));
-      col = mix(col, uGround * groundLight, below);
+    // Below the horizon: fade to a lit ground colour (bounce light for IBL).
+    // (GLSL smoothstep(0.0, -0.06, y), written with ordered edges for WGSL.)
+    const below = float(1.0).sub(smoothstep(-0.06, 0.0, direction.y));
+    const groundLight = dot(vSkyRef, vec3(0.2126, 0.7152, 0.0722)).mul(1.6)
+      .mul(float(0.35).add(float(0.65).mul(clamp(vSunDirection.y.mul(2.0), 0.0, 1.0))));
+    col.assign(mix(col, U.uGround.mul(groundLight), below));
+    sun.mulAssign(float(1.0).sub(below));
 
-      gl_FragColor = vec4(col, 1.0);
-      #include <tonemapping_fragment>
-      #include <colorspace_fragment>
-    }
-  `,
-};
+    // The disc is ~6e5 in these units, which overflows the half-float scene
+    // buffer to infinity and would smear NaN through bloom. ACES is flat
+    // white long before 64, so the cap is invisible except in the glow.
+    skySun.assign(sun.min(64.0));
+    return vec4(col.min(64.0), 1.0);
+  })();
+
+  const material = new THREE.MeshBasicNodeMaterial({
+    name: 'FpvSky',
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+  });
+  // Pin the dome to the far plane (the GLSL `gl_Position.z = gl_Position.w`).
+  material.vertexNode = Fn(() => {
+    const position = modelViewProjection.toVar();
+    position.z.assign(position.w);
+    return position;
+  })();
+  material.colorNode = colorNode;
+  material.emissiveNode = skySun;
+  material.uniforms = U;
+  return material;
+}
 
 /* ========================================================================== *
  * CPU port of the scattering model (sun colour, fog colour, sky ambient)
@@ -308,7 +330,7 @@ function sunTransmittance(sunDir, p) {
 
 export class Atmosphere {
   /**
-   * @param {THREE.WebGLRenderer} renderer
+   * @param {THREE.WebGPURenderer} renderer
    * @param {THREE.Scene} scene
    */
   constructor(renderer, scene) {
@@ -329,14 +351,15 @@ export class Atmosphere {
     this.group.name = 'atmosphere';
 
     /* ---- sun ---- */
-    this.sun = new THREE.DirectionalLight(0xffffff, 3);
-    this.sun.name = 'atmosphere-sun';
-    this.sun.castShadow = true;
-    this.sun.shadow.bias = -0.00035;
-    this.sun.shadow.normalBias = 0.035;
+    this.sun = null;
     this.sunTarget = new THREE.Object3D();
-    this.sun.target = this.sunTarget;
-    this.group.add(this.sun, this.sunTarget);
+    this.group.add(this.sunTarget);
+    this._makeSun();
+
+    /* ---- cascaded shadows (outdoor maps, see _setupCsm) ---- */
+    this.csm = null;
+    this._viewCamera = null;
+    this._csmProjKey = '';
 
     this.hemi = new THREE.HemisphereLight(0xbfd6f0, 0x4a4a38, 0.2);
     this.hemi.name = 'atmosphere-hemi';
@@ -359,6 +382,78 @@ export class Atmosphere {
     this._fwd = new THREE.Vector3();
 
     this.applyQuality();
+  }
+
+  /**
+   * (Re)create the sun light. A fresh light per map lets the outdoor/indoor
+   * shadow strategy change: the node system caches a light's shadow node the
+   * first time a material is built against it, so swapping a live light from
+   * a single shadow map to cascades would not take effect.
+   */
+  _makeSun() {
+    const prev = this.sun;
+    const sun = new THREE.DirectionalLight(0xffffff, 3);
+    sun.name = 'atmosphere-sun';
+    sun.castShadow = true;
+    sun.shadow.bias = -0.00035;
+    sun.shadow.normalBias = 0.035;
+    sun.target = this.sunTarget;
+    if (prev) {
+      sun.color.copy(prev.color);
+      sun.intensity = prev.intensity;
+      sun.position.copy(prev.position);
+      this.group.remove(prev);
+      try { prev.dispose(); } catch (_e) { /* ignore */ }
+    }
+    this.sun = sun;
+    this.group.add(sun);
+    return sun;
+  }
+
+  /** The camera the pilot sees through; cascaded shadows split its frustum. */
+  setViewCamera(camera) {
+    this._viewCamera = camera || null;
+  }
+
+  /**
+   * Cascaded shadow maps for open maps: `csmCascades` shadow maps split along
+   * the view frustum out to 4x the tier's shadow range, so the ground under
+   * the quad is centimetre-sharp and the far hills still cast shadows. This
+   * replaces the single frustum that _followShadow drags along with the drone.
+   * Part-roofed and indoor maps keep the pinned single map (their whole
+   * building has to be in the shadow volume at once).
+   */
+  _setupCsm() {
+    this._disposeCsm();
+    const q = activeQuality;
+    const cascades = q.csmCascades | 0;
+    if (cascades <= 0 || this._fixedFocus || !this._viewCamera) return;
+    if (this.renderer?.shadowMap?.enabled === false) return;
+    try {
+      const csm = new CSMShadowNode(this.sun, {
+        cascades,
+        maxFar: this.shadowRange * 4,
+        mode: 'practical',
+        lightMargin: 300,
+      });
+      // Bind the cascades to the pilot's camera now. Left to itself the node
+      // adopts whichever camera first compiles a lit material, which may be
+      // the environment capture or the water reflector.
+      csm._init({ camera: this._viewCamera, renderer: this.renderer });
+      this.sun.shadow.shadowNode = csm;
+      this.csm = csm;
+      this._csmProjKey = '';
+    } catch (err) {
+      console.warn('[Atmosphere] cascaded shadows unavailable; using the follow-shadow.', err);
+      this._disposeCsm();
+    }
+  }
+
+  _disposeCsm() {
+    if (!this.csm) return;
+    try { this.csm.dispose(); } catch (_e) { /* ignore */ }
+    if (this.sun?.shadow) this.sun.shadow.shadowNode = null;
+    this.csm = null;
   }
 
   /* ---------------------------------------------------------------------- *
@@ -406,18 +501,7 @@ export class Atmosphere {
       : null;
 
     try {
-      this.sky = new THREE.Mesh(
-        new THREE.BoxGeometry(1, 1, 1),
-        new THREE.ShaderMaterial({
-          name: 'FpvSky',
-          uniforms: THREE.UniformsUtils.clone(SKY_SHADER.uniforms),
-          vertexShader: SKY_SHADER.vertexShader,
-          fragmentShader: SKY_SHADER.fragmentShader,
-          side: THREE.BackSide,
-          depthWrite: false,
-          fog: false,
-        }),
-      );
+      this.sky = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), createSkyMaterial());
       this.sky.name = 'atmosphere-sky';
       this.sky.scale.setScalar(9000);
       this.sky.frustumCulled = false;
@@ -432,6 +516,7 @@ export class Atmosphere {
     this.sun.visible = true;
     this.sun.castShadow = true;
     this.applyQuality();
+    this._setupCsm();
     this._applyOutdoor(true);
   }
 
@@ -465,6 +550,8 @@ export class Atmosphere {
       this.sun.color.set(o.sun.color ?? 0xfff1dc);
       this.sun.intensity = Number.isFinite(o.sun.intensity) ? o.sun.intensity : 2.5;
       this.sun.visible = true;
+      sunState.direction.copy(this.sunDir);
+      sunState.color.copy(this.sun.color);
       this.sun.castShadow = o.sun.castShadow !== false;
     } else {
       this.sun.visible = false;
@@ -487,6 +574,8 @@ export class Atmosphere {
   /** Remove everything this module put into the scene. */
   reset() {
     try { this.scene.remove(this.group); } catch (_e) { /* ignore */ }
+    this._disposeCsm();
+    this._makeSun();
     if (this.sky) {
       try {
         this.group.remove(this.sky);
@@ -505,6 +594,7 @@ export class Atmosphere {
     this._indoorShadowRange = 0;
     this.sun.visible = false;
     this.sun.castShadow = false;
+    this.applyQuality();
   }
 
   /* ---------------------------------------------------------------------- *
@@ -572,6 +662,8 @@ export class Atmosphere {
     const lum = 0.2126 * tr[0] + 0.7152 * tr[1] + 0.0722 * tr[2];
     const horizonFade = smooth(-0.02, 0.12, this.sunDir.y);
     this.sun.intensity = p.sunIntensity * Math.pow(lum, 0.5) * horizonFade * (1 - oc * 0.78);
+    sunState.direction.copy(this.sunDir);
+    sunState.color.copy(this.sun.color).multiplyScalar(Math.max(0.05, horizonFade * (1 - oc * 0.6)));
     this.sun.shadow.intensity = p.shadowStrength * (1 - oc * 0.6);
 
     // --- fog + hemisphere from the horizon/zenith sky colour --------------
@@ -617,10 +709,7 @@ export class Atmosphere {
    * ---------------------------------------------------------------------- */
 
   _ensurePmrem() {
-    if (!this._pmrem) {
-      this._pmrem = new THREE.PMREMGenerator(this.renderer);
-      try { this._pmrem.compileCubemapShader(); } catch (_e) { /* optional */ }
-    }
+    if (!this._pmrem) this._pmrem = new THREE.PMREMGenerator(this.renderer);
     return this._pmrem;
   }
 
@@ -656,10 +745,23 @@ export class Atmosphere {
   }
 
   /**
+   * Re-create the environment map after a renderer rebuild (device loss):
+   * the old PMREM target belonged to the lost device.
+   */
+  rebuildEnvironment(probe = null) {
+    try { this._pmrem?.dispose(); } catch (_e) { /* ignore */ }
+    this._pmrem = null;
+    this._envTarget = null;
+    if (this.mode === 'outdoor') this._renderEnvironment();
+    else if (this.mode !== 'none') this.captureEnvironment(probe || this._lastProbe);
+  }
+
+  /**
    * Capture the built scene itself into the environment map (indoor maps).
    * Hides the given objects (the drone) while rendering.
    */
   captureEnvironment(position, hide = []) {
+    this._lastProbe = position ? new THREE.Vector3(position.x, position.y, position.z) : null;
     try {
       const pmrem = this._ensurePmrem();
       const hidden = [];
@@ -701,7 +803,29 @@ export class Atmosphere {
     }
 
     const f = this._fixedFocus || focus;
-    if (this.sun.visible && f && Number.isFinite(f.x)) this._followShadow(f);
+    if (!this.sun.visible || !f || !Number.isFinite(f.x)) return;
+    if (this.csm) this._aimCsm(f);
+    else this._followShadow(f);
+  }
+
+  /**
+   * With cascades the light only supplies a direction — each cascade fits
+   * its own frustum slice. Re-split when the camera's projection changes
+   * (FOV, lens mode, aspect).
+   */
+  _aimCsm(focus) {
+    this.sunTarget.position.copy(focus);
+    this.sun.position.copy(focus).addScaledVector(this.sunDir, 500);
+    this.sunTarget.updateMatrixWorld();
+    const cam = this._viewCamera;
+    if (cam) {
+      const e = cam.projectionMatrix.elements;
+      const key = `${e[0].toFixed(5)}|${e[5].toFixed(5)}|${cam.near}|${cam.far}`;
+      if (key !== this._csmProjKey) {
+        this._csmProjKey = key;
+        try { this.csm.updateFrustums(); } catch (_e) { /* ignore */ }
+      }
+    }
   }
 
   /**

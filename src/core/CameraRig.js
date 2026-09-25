@@ -1,8 +1,10 @@
 /**
  * core/CameraRig.js
  * ---------------------------------------------------------------------------
- * The FPV camera and its two alternates, plus the optional analog-goggle
- * post-process.
+ * The FPV camera and its two alternates. The picture itself — fisheye lens,
+ * rolling shutter, video system and the rest of the post pipeline — is built
+ * by render/PostStack.js; this module decides where the camera is and hands
+ * the stack a lens and video state every frame.
  *
  * The important detail here is that the camera does **not** rigidly follow the
  * airframe. A real FPV feed reaches your eyes through a camera sensor, an
@@ -21,17 +23,18 @@
  *   cinematic — wide, heavily damped, and runs the sim at half speed
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { settings } from './Settings.js';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { AfterimagePass } from 'three/examples/jsm/postprocessing/AfterimagePass.js';
+import { PostStack, PROP_LAYER } from '../render/PostStack.js';
+import { lensSetup, READOUT_SECONDS } from '../render/FpvLens.js';
 
 export const CAMERA_MODES = ['fpv', 'chase', 'cinematic'];
 
 const MODE_LABELS = { fpv: 'FPV', chase: 'CHASE', cinematic: 'CINEMATIC' };
+
+/** Horizontal FOV of the third-person cameras (rectilinear), degrees. */
+const CHASE_HFOV = 100;
+const CINEMATIC_HFOV = 80;
 
 /**
  * Where the camera sits on the frame: slightly forward of, and above, centre.
@@ -42,20 +45,25 @@ const DEFAULT_MOUNT = new THREE.Vector3(0, 0.035, -0.03);
 
 export class CameraRig {
   /**
-   * @param {THREE.WebGLRenderer} renderer
+   * @param {THREE.WebGPURenderer} renderer
    * @param {THREE.Scene} scene
    */
   constructor(renderer, scene) {
     this.renderer = renderer;
     this.scene = scene;
 
+    // `fov` here is a placeholder: the vertical FOV is derived every frame
+    // from the lens state (the `fov` setting is the *horizontal* FOV of the
+    // FPV image — see _applyLens).
     this.camera = new THREE.PerspectiveCamera(
-      settings.get('fov'),
+      90,
       1,
       0.04,     // tight near plane — the quad flies through 40 cm gaps
       1800,     // replaced per map by setViewDistance()
     );
     this.camera.position.set(0, 2, 4);
+    // Prop-blur discs live on their own layer so FPV can show them alone.
+    this.camera.layers.enable(PROP_LAYER);
 
     this.mode = 'fpv';
 
@@ -80,19 +88,17 @@ export class CameraRig {
     this._tmpQuat = new THREE.Quaternion();
     this._tmpVec = new THREE.Vector3();
 
-    /* ---- post-processing (built lazily) ---- */
-    this._composer = null;
-    this._crtPass = null;
-    this._bloomPass = null;
-    this._afterPass = null;
-    this._composerFailed = false;
-    this._fxKey = null;   // rebuild key: bloom|blur|crt — see render()
+    /* ---- post pipeline (render/PostStack.js) ---- */
+    this.postStack = new PostStack(renderer, scene, this.camera);
     this._size = { w: 1, h: 1 };
+    this._camRates = { yaw: 0, pitch: 0 };
+    this._invCamQ = new THREE.Quaternion();
+    this._avWorld = new THREE.Vector3();
 
     /* ---- FPV latency queue (pose history for a lagged goggle feed) ---- */
     this._poseQ = [];
 
-    /* ---- link quality, 0..1, drives VTX breakup in the CRT shader ---- */
+    /* ---- link quality, 0..1, drives VTX breakup in the video node ---- */
     this.rssi = 1;
     // Video-link profile for the current map: `range` is the distance (m) at
     // which the picture is half-quality; `indoor` adds multipath flicker.
@@ -107,6 +113,12 @@ export class CameraRig {
     this._lastWeatherQ = -1;
 
     this.applySettings();
+  }
+
+  /** Adopt a rebuilt renderer (device loss). */
+  setRenderer(renderer) {
+    this.renderer = renderer;
+    this.postStack?.setRenderer(renderer);
   }
 
   /**
@@ -148,13 +160,9 @@ export class CameraRig {
     }
   }
 
-  /** Sync FOV and tilt from the settings store. */
+  /** Sync the lens and tilt from the settings store. */
   applySettings() {
-    const fov = settings.get('fov');
-    if (Number.isFinite(fov) && Math.abs(this.camera.fov - fov) > 0.01) {
-      this.camera.fov = fov;
-      this.camera.updateProjectionMatrix();
-    }
+    this._applyLens();
     const tilt = settings.get('cameraTilt') * Math.PI / 180;
     // Positive rotation about local +X lifts the view direction, which is
     // exactly what raising the camera mount on a real quad does.
@@ -240,7 +248,7 @@ export class CameraRig {
     this.camera.quaternion.copy(this._smoothQuat);
 
     this._applyFpvLatency();
-    this._applyJello(drone);
+    this._measureCameraRates(drone);
   }
 
   _updateChase(dt, pos, quat) {
@@ -336,28 +344,64 @@ export class CameraRig {
   }
 
   /**
-   * Rolling-shutter jello: a horizontal skew proportional to the current
-   * body rate, exactly like a CMOS sensor reading out while the frame spins.
+   * Body rates in the camera frame, for the lens node's rolling-shutter
+   * shear (FpvLens.js). The picture is sheared in the shader rather than by
+   * skewing the projection, so it composes with the fisheye and with TRAA's
+   * sub-pixel jitter.
    */
-  _applyJello(drone) {
-    let rate = 0;
-    try {
-      rate = (drone && drone.body && drone.body.angularVelocity)
-        ? drone.body.angularVelocity.length()
-        : 0;
-    } catch (_e) { rate = 0; }
-    if (!Number.isFinite(rate)) rate = 0;
-    const shear = Math.min(0.004, Math.max(0, rate * 0.00012));
+  _measureCameraRates(drone) {
+    this._camRates.yaw = 0;
+    this._camRates.pitch = 0;
+    const av = drone?.body?.angularVelocity;
+    if (!av || !Number.isFinite(av.x) || !Number.isFinite(av.y) || !Number.isFinite(av.z)) return;
+    this._invCamQ.copy(this.camera.quaternion).invert();
+    this._avWorld.set(av.x, av.y, av.z).applyQuaternion(this._invCamQ);
+    if (isFiniteVector(this._avWorld)) {
+      this._camRates.yaw = this._avWorld.y;
+      this._camRates.pitch = this._avWorld.x;
+    }
+  }
 
-    try {
-      const w = this._size.w;
-      const h = this._size.h;
-      if (shear > 1e-5 && w > 0 && h > 0) {
-        this.camera.setViewOffset(w, h, shear * w, 0, w, h);
-      } else if (this.camera.view && this.camera.view.enabled) {
-        this.camera.clearViewOffset();
-      }
-    } catch (_e) { /* some render targets do not support view offsets */ }
+  /**
+   * Lens and projection for the current mode. FPV uses the `fov` setting as
+   * the horizontal FOV of the image through the chosen lens; the chase cameras
+   * are fixed rectilinear views. The perspective camera's vertical FOV is
+   * whatever the lens needs its source render to cover.
+   */
+  _applyLens() {
+    const fpv = this.mode === 'fpv';
+    const viewAspect = this._size.w / Math.max(1, this._size.h);
+    const system = settings.get('videoSystem') === 'analog' ? 'analog' : 'hd';
+    // Analog goggles show a 4:3 picture, pillarboxed on wider screens.
+    const imageAspect = fpv && system === 'analog' ? Math.min(viewAspect, 4 / 3) : viewAspect;
+    const lensMode = settings.get('fpvLens');
+    const mode = fpv ? (['rectilinear', 'fisheye', 'fisheye-cube'].includes(lensMode) ? lensMode : 'fisheye') : 'rectilinear';
+    const rawFov = settings.get('fov');
+    const hfov = fpv
+      ? (Number.isFinite(rawFov) ? Math.min(170, Math.max(70, rawFov)) : 145)
+      : (this.mode === 'cinematic' ? CINEMATIC_HFOV : CHASE_HFOV);
+    const k = settings.get('lensFisheye');
+    const state = {
+      mode,
+      fpv,
+      hfovDeg: hfov,
+      k: Number.isFinite(k) ? k : 0.8,
+      imageAspect,
+      viewAspect,
+      rates: fpv ? this._camRates : { yaw: 0, pitch: 0 },
+      readout: fpv ? READOUT_SECONDS[system] : 0,
+    };
+    const setup = lensSetup(state);
+    // Written as !(<=) so a NaN aspect also triggers the repair: TRAA's
+    // jitter calls setViewOffset(), which overwrites `aspect` from its render
+    // target and can leave NaN behind right after the graph is rebuilt.
+    if (!(Math.abs(this.camera.fov - setup.vfovDeg) <= 1e-4) || !(Math.abs(this.camera.aspect - viewAspect) <= 1e-6)) {
+      this.camera.fov = setup.vfovDeg;
+      this.camera.aspect = viewAspect;
+      this.camera.updateProjectionMatrix();
+    }
+    this._lensState = state;
+    return state;
   }
 
   /**
@@ -492,7 +536,6 @@ export class CameraRig {
     this._lookTarget.copy(pos);
     this._shakeTime = 0;
     this._poseQ.length = 0;
-    try { this.camera.clearViewOffset(); } catch (_e) { /* ignore */ }
   }
 
   /* ====================================================================== *
@@ -504,230 +547,53 @@ export class CameraRig {
     const h = Math.max(1, height | 0);
     this._size.w = w;
     this._size.h = h;
-
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-
-    if (this._composer) {
-      try {
-        this._composer.setSize(w, h);
-        if (this._crtPass) this._crtPass.uniforms.uResolution.value.set(w, h);
-      } catch (_e) { /* a resize failure must not kill the frame */ }
-    }
+    this._applyLens();
+    this.postStack?.resize(w, h);
   }
 
   /**
-   * Draw the scene, through the post chain when any effect is enabled.
-   * Chain order (all optional except the render): bloom → motion-blur trails
-   * → analog CRT look. Any failure permanently falls back to direct rendering
+   * Draw the frame through the post pipeline. If the stack cannot be built or
+   * throws mid-frame it marks itself failed and we render direct from then on
    * rather than leaving the user with a black screen.
-   *
-   * Performance-first: with every toggle off this disposes the composer and
-   * renders direct — zero post cost on integrated GPUs.
    */
   render() {
-    const wantBloom = settings.get('bloom') === true && !this._composerFailed;
-    const wantBlur = settings.get('motionBlur') === true && !this._composerFailed;
-    const wantCrt = settings.get('crtFilter') && !this._composerFailed;
-    const wantComposer = wantBloom || wantBlur || wantCrt;
-    const fxKey = `${wantBloom}|${wantBlur}|${wantCrt}`;
-
-    if (!wantComposer) {
-      if (this._composer) this._disposeComposer();
-      this._fxKey = null;
-      this.renderer.render(this.scene, this.camera);
-      return;
-    }
-
-    if (!this._composer || this._fxKey !== fxKey) this._buildComposer(wantBloom, wantBlur, wantCrt);
-    if (this._composer) {
+    const stack = this.postStack;
+    if (stack && !stack.failed) {
       try {
-        if (this._bloomPass) {
-          const raw = settings.get('bloomStrength');
-          const s = Number.isFinite(raw) ? Math.min(1.2, Math.max(0, raw)) : 0.55;
-          this._bloomPass.strength = 0.15 + s * 0.85;
-        }
-        if (this._afterPass && this._afterPass.uniforms && this._afterPass.uniforms.damp) {
-          // Trail length scales with airspeed so hovering stays crisp while
-          // a 40 m/s dive smears — the FPV speed feel, for one fullscreen pass.
-          let speed = 0;
-          try {
-            const v = this._lastDrone?.telemetry?.speed;
-            if (Number.isFinite(v)) speed = v;
-          } catch (_e) { /* ignore */ }
-          this._afterPass.uniforms.damp.value = 0.35 + Math.min(0.5, speed * 0.012);
-        }
-        if (this._crtPass) {
-          this._crtPass.uniforms.uTime.value = performance.now() * 0.001;
-
-          const fov = Number.isFinite(this.camera.fov) ? this.camera.fov : 130;
-          // Lens slider 0..0.3 scales the legacy FOV-linked barrel term, so
-          // the default (0.14) reproduces the old look exactly at every FOV
-          // and 0 disables distortion entirely.
-          const rawLens = settings.get('lensDistortion');
-          const lens = Number.isFinite(rawLens) ? Math.min(0.3, Math.max(0, rawLens)) : 0.14;
-          this._crtPass.uniforms.uLens.value = (0.08 + (fov - 90) * 0.0015) * (lens / 0.14);
-
-          const breakupSetting = settings.get('vtxBreakup');
-          const breakupOn = typeof breakupSetting === 'boolean' ? breakupSetting : true;
-          this._crtPass.uniforms.uRssi.value = breakupOn ? clamp01(this.rssi) : 1;
-        }
-        this._composer.render();
-        return;
+        const lens = this._applyLens();
+        stack.setFpvLens(lens);
+        const breakupSetting = settings.get('vtxBreakup');
+        stack.setVideo({
+          system: settings.get('videoSystem') === 'analog' ? 'analog' : 'hd',
+          active: this.mode === 'fpv',
+          rssi: clamp01(this.rssi),
+          breakup: typeof breakupSetting === 'boolean' ? breakupSetting : true,
+          time: performance.now() * 0.001,
+        });
+        let speed = 0;
+        try {
+          const v = this._lastDrone?.telemetry?.speed;
+          if (Number.isFinite(v)) speed = v;
+        } catch (_e) { /* ignore */ }
+        stack.setEffects({
+          bloom: settings.get('bloom') === true,
+          bloomStrength: settings.get('bloomStrength'),
+          motionBlur: settings.get('motionBlur') === true,
+          speed,
+        });
+        if (stack.render()) return;
       } catch (err) {
-        console.warn('[CameraRig] post-processing failed; reverting to direct render.', err);
-        this._composerFailed = true;
-        this._disposeComposer();
+        console.warn('[CameraRig] post pipeline failed; rendering direct.', err);
+        stack.failed = true;
       }
     }
-
     this.renderer.render(this.scene, this.camera);
   }
 
-  /**
-   * Build the post chain for exactly the enabled effects, lazily, the first
-   * time they are switched on. Everything is wrapped: if the composer cannot
-   * be created we set _composerFailed and fall back to direct rendering
-   * permanently, rather than retrying (and failing) on every single frame.
-   */
-  _buildComposer(wantBloom = false, wantBlur = false, wantCrt = false) {
-    this._disposeComposer();
-    try {
-      this._composer = new EffectComposer(this.renderer);
-      this._composer.addPass(new RenderPass(this.scene, this.camera));
-
-      this._bloomPass = null;
-      this._afterPass = null;
-      this._crtPass = null;
-
-      if (wantBloom) {
-        // Selective by luminance: threshold ~1.0 so only emissive lamps,
-        // windows, and gate rings bloom — never the whole daylight scene.
-        this._bloomPass = new UnrealBloomPass(
-          new THREE.Vector2(this._size.w, this._size.h), 0.6, 0.5, 1.0,
-        );
-        this._composer.addPass(this._bloomPass);
-      }
-      if (wantBlur) {
-        this._afterPass = new AfterimagePass();
-        this._composer.addPass(this._afterPass);
-      }
-      if (wantCrt) {
-        this._crtPass = new ShaderPass(CRT_SHADER);
-        this._crtPass.uniforms.uResolution.value.set(this._size.w, this._size.h);
-        this._composer.addPass(this._crtPass);
-      }
-      this._composer.setSize(this._size.w, this._size.h);
-      this._fxKey = `${wantBloom}|${wantBlur}|${wantCrt}`;
-    } catch (err) {
-      console.warn('[CameraRig] could not build post-processing chain.', err);
-      this._composerFailed = true;
-      this._composer = null;
-      this._crtPass = null;
-      this._bloomPass = null;
-      this._afterPass = null;
-    }
-  }
-
-  _disposeComposer() {
-    try {
-      this._composer?.dispose?.();
-      this._bloomPass?.dispose?.();
-      this._afterPass?.dispose?.();
-      this._crtPass?.dispose?.();
-    } catch (_e) { /* ignore */ }
-    this._composer = null;
-    this._crtPass = null;
-    this._bloomPass = null;
-    this._afterPass = null;
-  }
-
   dispose() {
-    this._disposeComposer();
+    this.postStack?.dispose();
   }
 }
-
-/* ========================================================================== *
- * Post-processing chain
- * ========================================================================== */
-
-/**
- * Cheap analog-video look: RGB split that grows toward the edges, rolling
- * scanlines, film-grain noise, and a signal vignette. One texture fetch per
- * channel and no blur passes, so it costs almost nothing.
- */
-const CRT_SHADER = {
-  name: 'AnalogGoggleShader',
-  uniforms: {
-    tDiffuse: { value: null },
-    uTime: { value: 0 },
-    uResolution: { value: new THREE.Vector2(1, 1) },
-    uLens: { value: 0.12 },
-    uRssi: { value: 1 },
-  },
-  vertexShader: /* glsl */`
-    varying vec2 vUv;
-    void main() {
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
-  fragmentShader: /* glsl */`
-    uniform sampler2D tDiffuse;
-    uniform float uTime;
-    uniform vec2 uResolution;
-    uniform float uLens;
-    uniform float uRssi;
-    varying vec2 vUv;
-
-    float hash(vec2 p) {
-      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-    }
-
-    void main() {
-      vec2 uv = vUv;
-      vec2 centered = uv - 0.5;
-      float r2 = dot(centered, centered);
-
-      // Barrel distortion: a cheap lens, worse at wider FOV.
-      uv += centered * r2 * uLens;
-
-      float rssi = clamp(uRssi, 0.0, 1.0);
-      // VTX signal loss: a horizontal tear that grows as link quality drops.
-      if (rssi < 0.35) {
-        float tear = step(0.9, fract(uv.y * 3.0 + uTime)) * 0.02 * (0.35 - rssi);
-        uv.x += tear;
-      }
-
-      // Chromatic aberration: zero at the centre, growing toward the corners,
-      // which is how a cheap lens and an analog link both actually fail.
-      float ca = 0.0022 * r2 * 4.0;
-      vec3 col;
-      col.r = texture2D(tDiffuse, uv + centered * ca).r;
-      col.g = texture2D(tDiffuse, uv).g;
-      col.b = texture2D(tDiffuse, uv - centered * ca).b;
-
-      // Scanlines, slowly rolling so they never sit still on the panel.
-      float lines = sin((uv.y + uTime * 0.02) * uResolution.y * 1.6);
-      col *= 1.0 - 0.085 * (0.5 + 0.5 * lines);
-
-      // Signal noise, strongest where the picture is darkest.
-      float n = hash(uv * uResolution.xy * 0.5 + uTime * 60.0);
-      col += (n - 0.5) * 0.045 * (1.2 - dot(col, vec3(0.333)));
-
-      // VTX breakup: extra luma noise and desaturation as RSSI drops.
-      float breakupN = hash(uv * uResolution.xy * 0.37 + uTime * 91.0);
-      col += (1.0 - rssi) * (breakupN - 0.5) * 0.35;
-      float luma = dot(col, vec3(0.299, 0.587, 0.114));
-      col = mix(col, vec3(luma), (1.0 - rssi) * 0.6);
-
-      // Vignette.
-      col *= smoothstep(0.92, 0.22, r2);
-
-      gl_FragColor = vec4(col, 1.0);
-    }
-  `,
-};
 
 /* ========================================================================== *
  * Helpers

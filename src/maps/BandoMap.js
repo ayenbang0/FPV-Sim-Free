@@ -16,7 +16,7 @@
  * a gate hanging from the crane hook, and a dive down the atrium shaft.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import {
   concreteTexture, rustTexture, crateWoodTexture, paintedMetalTexture, graffitiTexture,

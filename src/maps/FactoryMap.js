@@ -25,7 +25,7 @@
  * chimney yard, a gate cantilevered off the chimney, and the finish.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import {
   concreteTexture, corrugatedMetalTexture, rustTexture,
@@ -90,6 +90,9 @@ export class FactoryMap {
       groundColor: 0x6a655a,
       shadowRange: 100,
       shadowFocus: [32, 0, 0],
+      // Skylight sunbeams: the post pipeline adds screen-space godrays from
+      // the sun's shadow map on high/ultra (the beam cards stay).
+      godrays: true,
     };
     this.builder = null;
     this._dust = null;

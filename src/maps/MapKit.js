@@ -27,7 +27,8 @@
  * API is identical either way.
  */
 
-import * as THREE from 'three';
+import { settings } from '../core/Settings.js';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { GROUP } from '../core/PhysicsWorld.js';
@@ -538,8 +539,13 @@ export class MapBuilder {
     if (style === 'square' || style === 'dive') {
       shape = 'square';
       const dive = style === 'dive';
-      const w = width ?? radius * 2;
-      const h = dive ? w : (height ?? w);
+      let w = width ?? radius * 2;
+      let h = dive ? w : (height ?? w);
+      if (settings.get('gateSpec') === 'multigp') {
+        // MultiGP spec: 5 ft (1.524 m) square gates, 10 × 5 ft hurdles.
+        // Position and rotation stay as authored, so openings shrink in place.
+        if (!dive && w >= 1.5 * h) { w = 3.048; h = 1.524; } else { w = 1.524; h = 1.524; }
+      }
       halfW = w / 2;
       halfH = h / 2;
       const t = Math.max(0.1, Math.min(0.28, w * 0.075));   // bar thickness
@@ -697,7 +703,9 @@ export class MapBuilder {
   _gateLedMaterials() {
     return {
       idle: this.material('gate-led-idle', () => new THREE.MeshStandardMaterial({
-        color: 0x16305c, emissive: GATE_COLORS.idle, emissiveIntensity: 0.9,
+        // 2.4 clears the post pipeline's 0.9 bloom threshold, so idle gate
+        // LEDs glow like the real strips do on camera.
+        color: 0x16305c, emissive: GATE_COLORS.idle, emissiveIntensity: 2.4,
         roughness: 0.5, metalness: 0.1,
       })),
       active: this.material('gate-led-active', () => new THREE.MeshStandardMaterial({

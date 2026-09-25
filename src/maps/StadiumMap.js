@@ -15,7 +15,7 @@
  * and a finish on the centre spot.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import {
   grassTexture, concreteTexture, paintedMetalTexture, bannerTexture, corrugatedMetalTexture,

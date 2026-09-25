@@ -12,10 +12,13 @@
  * a bad value even if the DOM hands us something unexpected.
  */
 
-import { settings, REMAPPABLE, defaultGamepadMapping, RATE_PRESETS, RATE_PRESET_IDS } from '../core/Settings.js';
+import { settings, REMAPPABLE, defaultGamepadMapping, RATE_PRESETS, RATE_PRESET_IDS, RATES_TYPES, RADIO_PRESETS } from '../core/Settings.js';
+import { SerialRx } from '../input/SerialRx.js';
+import { applyRates, maxRcRate } from '../fc/rates.js';
 import { CALIBRATABLE_AXES, CALIBRATION_STEPS, axisEndpoints } from '../core/InputManager.js';
 import { listAirframes, airframeStats } from '../core/DroneTypes.js';
 import { formatTime } from './HUD.js';
+import { VIDEO_LATENCY_MS } from '../render/FpvVideo.js';
 
 /* ========================================================================== *
  * Shared widgets
@@ -113,6 +116,221 @@ export function heading(text) {
   const h = document.createElement('h2');
   h.textContent = text;
   return h;
+}
+
+function numberCell(value, { min, max, step = 1, onChange }) {
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = String(min);
+  input.max = String(max);
+  input.step = String(step);
+  input.value = String(value);
+  input.style.width = '4.2em';
+  input.addEventListener('change', () => {
+    const v = parseFloat(input.value);
+    if (!Number.isFinite(v)) return;
+    const c = Math.min(max, Math.max(min, v));
+    input.value = String(c);
+    onChange?.(c);
+  });
+  return input;
+}
+
+const RATE_LABELS = {
+  actual: ['Center', 'Max', 'Expo'],
+  betaflight: ['RC Rate', 'Super', 'Expo'],
+  quick: ['RC Rate', 'Max', 'Expo'],
+  kiss: ['RC Rate', 'Rate', 'RC Curve'],
+  raceflight: ['Rate', 'Acro+', 'Expo'],
+};
+
+/** Draw all three axis curves of the current fcRates into a canvas. */
+function drawRateCurve(canvas, rates) {
+  const ctx = canvas.getContext?.('2d');
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const maxes = [0, 1, 2].map((a) => maxRcRate(rates.type, a, rates));
+  const top = Math.max(200, ...maxes) * 1.05;
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const y = h - (g / 4) * h;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  const colors = ['#ff6b6b', '#6bd4ff', '#ffd166'];
+  for (let a = 0; a < 3; a++) {
+    ctx.strokeStyle = colors[a];
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let i = 0; i <= 60; i++) {
+      const x = i / 60;
+      const v = applyRates(rates.type, a, x, rates);
+      const px = x * w;
+      const py = h - (v / top) * h;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.fillStyle = colors[a];
+    ctx.font = '11px monospace';
+    ctx.fillText(`${['R', 'P', 'Y'][a]} ${Math.round(maxes[a])}°/s`, 6, 14 + a * 13);
+  }
+}
+
+/**
+ * The Betaflight tuning widgets (rates, PIDs, masters, filters, airmode),
+ * shared by the main Settings page and the pause menu.
+ * @param {HTMLElement} panel
+ * @param {() => void} changed   called after every settings write
+ * @param {() => void} [rerender] rebuild the page (rates type / reset)
+ */
+export function renderBetaflightTuning(panel, changed, rerender) {
+  const setRates = (patch) => {
+    settings.set({ fcRates: { ...settings.get('fcRates'), ...patch }, ratePreset: 'custom' });
+    changed();
+  };
+  const r = settings.get('fcRates');
+
+  panel.append(heading('Betaflight — rates'));
+  panel.append(selectRow('Rate preset', {
+    options: RATE_PRESET_IDS.map((id) => ({ value: id, label: RATE_PRESETS[id].label })),
+    value: settings.get('ratePreset'),
+    onChange: (v) => { settings.loadRatePreset(v); changed(); rerender?.(); },
+  }));
+  panel.append(selectRow('Rates type', {
+    options: RATES_TYPES.map((t) => ({ value: t, label: t === 'actual' ? 'Actual' : t === 'betaflight' ? 'Betaflight' : t === 'quick' ? 'Quick' : t === 'kiss' ? 'KISS' : 'RaceFlight' })),
+    value: r.type,
+    onChange: (v) => { setRates({ type: v }); rerender?.(); },
+  }));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 240;
+  canvas.height = 120;
+  canvas.style.cssText = 'display:block;margin:6px 0 10px;background:rgba(0,0,0,0.35);border-radius:4px';
+
+  const labels = RATE_LABELS[r.type] || RATE_LABELS.betaflight;
+  const table = document.createElement('table');
+  table.className = 'kv';
+  const head = document.createElement('tr');
+  for (const t of ['', ...labels]) {
+    const th = document.createElement('th');
+    th.textContent = t;
+    head.append(th);
+  }
+  table.append(head);
+  const rateMax = r.type === 'actual' ? 200 : 255;
+  ['Roll', 'Pitch', 'Yaw'].forEach((name, axis) => {
+    const tr = document.createElement('tr');
+    const td0 = document.createElement('td');
+    td0.textContent = name;
+    tr.append(td0);
+    for (const [key, min, max] of [['rcRates', 1, 255], ['rates', 0, rateMax], ['rcExpo', 0, 100]]) {
+      const td = document.createElement('td');
+      td.append(numberCell(settings.get('fcRates')[key][axis], {
+        min, max,
+        onChange: (v) => {
+          const arr = settings.get('fcRates')[key].slice();
+          arr[axis] = Math.round(v);
+          setRates({ [key]: arr });
+          drawRateCurve(canvas, settings.get('fcRates'));
+        },
+      }));
+      tr.append(td);
+    }
+    table.append(tr);
+  });
+  panel.append(table, canvas);
+  drawRateCurve(canvas, r);
+  const unitHint = document.createElement('p');
+  unitHint.className = 'hint';
+  unitHint.textContent = r.type === 'actual'
+    ? 'Actual rates, Betaflight units: Center and Max are deg/s ÷ 10, Expo in %.'
+    : 'Betaflight units, exactly as the Configurator shows them (×100 values as integers).';
+  panel.append(unitHint);
+
+  /* ---- PIDs ---- */
+  panel.append(heading('Betaflight — PID tuning'));
+  const pt = document.createElement('table');
+  pt.className = 'kv';
+  const ph = document.createElement('tr');
+  for (const t of ['', 'P', 'I', 'D', 'D max', 'F']) {
+    const th = document.createElement('th');
+    th.textContent = t;
+    ph.append(th);
+  }
+  pt.append(ph);
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    const tr = document.createElement('tr');
+    const td0 = document.createElement('td');
+    td0.textContent = cap(axis);
+    tr.append(td0);
+    for (const [key, max] of [['p', 250], ['i', 250], ['d', 250], ['dMax', 250], ['f', 1000]]) {
+      const td = document.createElement('td');
+      td.append(numberCell(settings.get('fcPid')[axis][key], {
+        min: 0, max,
+        onChange: (v) => {
+          const pid = settings.get('fcPid');
+          settings.set('fcPid', { ...pid, [axis]: { ...pid[axis], [key]: Math.round(v) } });
+          changed();
+        },
+      }));
+      tr.append(td);
+    }
+    pt.append(tr);
+  }
+  panel.append(pt);
+
+  const pidSlider = (label, key, min, max, fmt) => sliderRow(label, {
+    min, max, step: 1, value: settings.get('fcPid')[key], format: fmt || ((v) => String(Math.round(v))),
+    onInput: (v) => { settings.set('fcPid', { ...settings.get('fcPid'), [key]: Math.round(v) }); changed(); },
+  });
+  const misc = (label, key, min, max, step, fmt) => sliderRow(label, {
+    min, max, step, value: settings.get('fcMisc')[key], format: fmt || ((v) => String(v)),
+    onInput: (v) => { settings.set('fcMisc', { ...settings.get('fcMisc'), [key]: v }); changed(); },
+  });
+  const filt = (label, key, min, max) => sliderRow(label, {
+    min, max, step: 1, value: settings.get('fcFilters')[key], format: (v) => (v > 0 ? `${Math.round(v)} Hz` : 'off'),
+    onInput: (v) => { settings.set('fcFilters', { ...settings.get('fcFilters'), [key]: Math.round(v) }); changed(); },
+  });
+
+  panel.append(pidSlider('Angle limit', 'angleLimit', 10, 90, (v) => `${Math.round(v)}°`));
+  panel.append(pidSlider('Angle strength (level P)', 'levelP', 0, 200));
+  panel.append(misc('Anti-gravity gain', 'antiGravityGain', 0, 250, 1));
+  panel.append(misc('I-term relax cutoff', 'itermRelaxCutoff', 1, 50, 1, (v) => `${v} Hz`));
+  panel.append(misc('TPA rate', 'tpaRate', 0, 100, 1, (v) => `${v}%`));
+  panel.append(misc('TPA breakpoint', 'tpaBreakpoint', 1000, 2000, 10, (v) => `${v} µs`));
+  panel.append(misc('Throttle boost', 'throttleBoost', 0, 100, 1));
+  panel.append(misc('Dshot idle', 'dshotIdle', 0, 20, 0.1, (v) => `${Number(v).toFixed(1)}%`));
+  panel.append(misc('FF jitter reduction', 'ffJitter', 0, 20, 1));
+  panel.append(misc('FF smoothness', 'ffSmooth', 0, 95, 1));
+  panel.append(misc('FF boost', 'ffBoost', 0, 50, 1));
+  panel.append(toggleRow('Airmode', {
+    value: settings.get('fcMisc').airmode,
+    hint: 'Full rotation authority at zero and full throttle.',
+    onChange: (v) => { settings.set('fcMisc', { ...settings.get('fcMisc'), airmode: v }); changed(); },
+  }));
+
+  panel.append(heading('Betaflight — filters'));
+  panel.append(filt('Gyro LPF1 dynamic min', 'gyroLpf1Min', 0, 1000));
+  panel.append(filt('Gyro LPF1 dynamic max', 'gyroLpf1Max', 0, 1000));
+  panel.append(filt('Gyro LPF2', 'gyroLpf2', 0, 1000));
+  panel.append(filt('D-term LPF1 dynamic min', 'dtermLpf1Min', 0, 500));
+  panel.append(filt('D-term LPF1 dynamic max', 'dtermLpf1Max', 0, 500));
+  panel.append(filt('D-term LPF2', 'dtermLpf2', 0, 500));
+  panel.append(filt('Yaw lowpass', 'yawLowpass', 0, 500));
+  panel.append(toggleRow('RPM filter', {
+    value: settings.get('fcFilters').rpmFilter,
+    onChange: (v) => { settings.set('fcFilters', { ...settings.get('fcFilters'), rpmFilter: v }); changed(); },
+  }));
+
+  const row = document.createElement('div');
+  row.className = 'btn-row';
+  row.append(button('Reset to airframe tune', {
+    small: true,
+    onClick: () => { settings.loadAirframeProfile(settings.get('droneType')); changed(); rerender?.(); },
+  }));
+  panel.append(row);
 }
 
 /* ========================================================================== *
@@ -227,6 +445,18 @@ export class MainMenu {
 
     /* ---- 2. sceneries ---- */
     panel.append(this._sectionHead('launch-maps', 'Sceneries'));
+    panel.append(selectRow('Gate spec', {
+      options: [
+        { value: 'league', label: 'League gates (as built)' },
+        { value: 'multigp', label: 'MultiGP spec (5 ft square, 10×5 ft hurdle)' },
+      ],
+      value: settings.get('gateSpec'),
+      onChange: (v) => {
+        settings.set('gateSpec', v);
+        this.deps.onSettingsChanged?.();
+        this.deps.onToast?.('info', 'Reload map to apply');
+      },
+    }));
     panel.append(this._buildMapGrid());
 
     /* ---- 3. quads ---- */
@@ -564,6 +794,18 @@ export class MainMenu {
       : 'No controller detected';
     panel.append(tag);
 
+    panel.append(selectRow('Load radio preset', {
+      options: [{ value: '', label: '— choose —' },
+        ...Object.entries(RADIO_PRESETS).map(([id, p]) => ({ value: id, label: p.label }))],
+      value: '',
+      onChange: (v) => {
+        if (!v) return;
+        settings.loadRadioPreset(v);
+        this.deps.onSettingsChanged?.();
+        this.render();
+      },
+    }));
+
     if (!st.gamepadConnected) {
       const p0 = document.createElement('p');
       p0.className = 'hint';
@@ -773,6 +1015,146 @@ export class MainMenu {
    * Settings page
    * ---------------------------------------------------------------------- */
 
+  /**
+   * Settings → Radio: source status, 16-channel monitor, channel map, the
+   * Betaflight Modes editor, and the WebSerial receiver connection.
+   */
+  _renderRadio(panel, changed) {
+    const input = this.deps.input;
+    panel.append(heading('Radio'));
+
+    const status = document.createElement('p');
+    status.className = 'hint';
+    panel.append(status);
+
+    const mon = document.createElement('div');
+    const bars = [];
+    const names = ['ROLL', 'PITCH', 'THR', 'YAW'];
+    for (let i = 0; i < 16; i++) {
+      const line = document.createElement('div');
+      line.className = 'axis-line';
+      const nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = i < 4 ? names[i] : `AUX${i - 3}`;
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      const fill = document.createElement('div');
+      fill.style.cssText = 'position:absolute;top:0;bottom:0;left:0;background:var(--accent,#5cf);opacity:0.8';
+      bar.append(fill);
+      const val = document.createElement('span');
+      val.style.cssText = 'flex:0 0 44px;text-align:right';
+      line.append(nm, bar, val);
+      mon.append(line);
+      bars.push({ fill, val });
+    }
+    panel.append(mon);
+
+    const tickMonitor = () => {
+      if (!mon.isConnected) return;
+      const ch = input?.controls?.channels;
+      if (ch) {
+        for (let i = 0; i < 16; i++) {
+          const v = ch[i];
+          bars[i].fill.style.width = `${Math.max(0, Math.min(100, (v - 1000) / 10))}%`;
+          bars[i].val.textContent = String(Math.round(v));
+        }
+      }
+      const src = input?.activeSource || 'keyboard';
+      const ser = input?.serial;
+      status.textContent = `Source: ${src.toUpperCase()}` +
+        (input?.controls?.switchArming ? ' · arming by ARM switch' : ' · arming by button / SPACE') +
+        (ser && ser.connected ? ` · receiver ${Math.round(ser.stats.fps)} fps` +
+          (Number.isFinite(ser.stats.lq) ? ` · LQ ${ser.stats.lq}` : '') + ` · ${ser.stats.errors} CRC errors` : '');
+      requestAnimationFrame(tickMonitor);
+    };
+    requestAnimationFrame(tickMonitor);
+
+    panel.append(selectRow('Channel map', {
+      options: [{ value: 'AETR', label: 'AETR (Betaflight default)' }, { value: 'TAER', label: 'TAER (Spektrum / Futaba)' }],
+      value: settings.get('rxChannelMap'),
+      onChange: (v) => { settings.set('rxChannelMap', v); changed(); },
+    }));
+
+    /* ---- modes editor ---- */
+    const modesHead = document.createElement('p');
+    modesHead.className = 'hint';
+    modesHead.textContent = 'Modes (Betaflight Modes tab): a mode is active while its channel is inside the range.';
+    panel.append(modesHead);
+    const modeIds = ['ARM', 'ANGLE', 'HORIZON', 'FLIPOVERAFTERCRASH', 'BEEPER', 'PREARM'];
+    const writeModes = (list) => { settings.set('modes', list); changed(); };
+    for (const id of modeIds) {
+      const cur = settings.get('modes').find((m) => m.mode === id);
+      const row = document.createElement('div');
+      row.className = 'row';
+      const lab = document.createElement('label');
+      lab.textContent = id === 'FLIPOVERAFTERCRASH' ? 'CRASH FLIP' : id;
+      const sel = document.createElement('select');
+      for (const [v, t] of [['-1', 'off'], ...Array.from({ length: 12 }, (_, i) => [String(i + 4), `AUX ${i + 1}`])]) {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = t;
+        if ((cur ? String(cur.channel) : '-1') === v) o.selected = true;
+        sel.append(o);
+      }
+      const mk = (val) => {
+        const inp = document.createElement('input');
+        inp.type = 'number'; inp.min = '900'; inp.max = '2100'; inp.step = '25';
+        inp.value = String(val); inp.style.width = '4.6em';
+        return inp;
+      };
+      const lo = mk(cur ? cur.min : 1700);
+      const hi = mk(cur ? cur.max : 2100);
+      const commit = () => {
+        const list = settings.get('modes').filter((m) => m.mode !== id);
+        const chn = parseInt(sel.value, 10);
+        if (chn >= 4) list.push({ mode: id, channel: chn, min: parseInt(lo.value, 10) || 900, max: parseInt(hi.value, 10) || 2100 });
+        writeModes(list);
+      };
+      sel.addEventListener('change', commit);
+      lo.addEventListener('change', commit);
+      hi.addEventListener('change', commit);
+      row.append(lab, sel, lo, hi);
+      panel.append(row);
+    }
+
+    /* ---- serial receiver ---- */
+    panel.append(selectRow('Serial protocol', {
+      options: [{ value: 'crsf', label: 'CRSF (ELRS / Crossfire)' }, { value: 'sbus', label: 'SBUS' }],
+      value: settings.get('serialProtocol'),
+      onChange: (v) => { settings.set('serialProtocol', v); changed(); this.render(); },
+    }));
+    if (settings.get('serialProtocol') === 'crsf') {
+      panel.append(selectRow('CRSF baud', {
+        options: [420000, 416666, 921600].map((b) => ({ value: String(b), label: String(b) })),
+        value: String(settings.get('serialBaud')),
+        onChange: (v) => { settings.set('serialBaud', parseInt(v, 10)); changed(); },
+      }));
+    }
+    const serRow = document.createElement('div');
+    serRow.className = 'btn-row';
+    const supported = SerialRx.supported();
+    const connectBtn = button(input?.serial?.connected ? 'Reconnect receiver' : 'Connect receiver', {
+      small: true, primary: true,
+      onClick: async () => {
+        try {
+          await input.connectSerial({ protocol: settings.get('serialProtocol'), baud: settings.get('serialBaud') });
+        } catch (err) {
+          status.textContent = `Serial: ${err?.message || err}`;
+        }
+      },
+    });
+    connectBtn.disabled = !supported;
+    serRow.append(connectBtn);
+    panel.append(serRow);
+    const serHint = document.createElement('p');
+    serHint.className = 'hint';
+    serHint.textContent = !supported
+      ? 'WebSerial needs Chrome/Edge'
+      : settings.get('serialProtocol') === 'sbus'
+        ? 'SBUS needs an uninverted signal (an F4 uninverted pad or an inverter).'
+        : 'Wire the receiver\'s TX to a USB-serial adapter (or use FC passthrough) and connect.';
+    panel.append(serHint);
+  }
+
   _renderSettings(panel) {
     const h1 = document.createElement('h1');
     h1.textContent = 'SETTINGS';
@@ -796,21 +1178,16 @@ export class MainMenu {
         { value: 'auto', label: 'Auto-detect (last device used)' },
         { value: 'keyboard', label: 'Keyboard only' },
         { value: 'gamepad', label: 'Controller only' },
+        { value: 'serial', label: 'Serial receiver (CRSF / SBUS)' },
       ],
       value: settings.get('inputMode'),
       onChange: (v) => { settings.set('inputMode', v); changed(); },
     }));
 
-    panel.append(sliderRow('Dead zone', {
-      min: 0, max: 0.4, step: 0.01, value: settings.get('deadzone'),
-      format: (v) => `${Math.round(v * 100)}%`,
-      onInput: (v) => { settings.set('deadzone', v); changed(); },
-    }));
-
-    panel.append(sliderRow('Expo', {
-      min: 0, max: 1, step: 0.01, value: settings.get('expo'),
-      format: (v) => `${Math.round(v * 100)}%`,
-      onInput: (v) => { settings.set('expo', v); changed(); },
+    panel.append(sliderRow('RC deadband', {
+      min: 0, max: 50, step: 1, value: settings.get('rcDeadband'),
+      format: (v) => `${Math.round(v)} µs`,
+      onInput: (v) => { settings.set('rcDeadband', Math.round(v)); changed(); },
     }));
 
     panel.append(toggleRow('Spring-centred throttle', {
@@ -841,109 +1218,19 @@ export class MainMenu {
       'changes the layout; X is the one browsers understand natively.)';
     panel.append(gpHint);
 
-    /* ---- rates ---- */
-    panel.append(heading('Rates & sensitivity'));
-    for (const axis of ['roll', 'pitch', 'yaw']) {
-      panel.append(sliderRow(`${cap(axis)} rate`, {
-        min: 100, max: axis === 'yaw' ? 900 : 1400, step: 10,
-        value: settings.get('rates')[axis],
-        format: (v) => `${Math.round(v)}°/s`,
-        onInput: (v) => {
-          settings.set('rates', { ...settings.get('rates'), [axis]: v });
-          changed();
-        },
-      }));
-    }
-    for (const axis of ['roll', 'pitch', 'yaw']) {
-      panel.append(sliderRow(`${cap(axis)} sensitivity`, {
-        min: 0.2, max: 2, step: 0.05,
-        value: settings.get('sensitivity')[axis],
-        format: (v) => `${v.toFixed(2)}x`,
-        onInput: (v) => {
-          settings.set('sensitivity', { ...settings.get('sensitivity'), [axis]: v });
-          changed();
-        },
-      }));
-    }
+    /* ---- Radio ---- */
+    this._renderRadio(panel, changed);
 
-    /* ---- rate presets & curves ---- */
-    panel.append(heading('Rate presets & curves'));
-    panel.append(selectRow('Community preset', {
-      options: RATE_PRESET_IDS.map((id) => ({ value: id, label: RATE_PRESETS[id].label })),
-      value: settings.get('ratePreset'),
-      onChange: (v) => {
-        settings.loadRatePreset(v);
-        changed();
-        this.render();   // refresh every slider to the preset's values
-      },
-    }));
-    panel.append(selectRow('Curve system', {
-      options: [
-        { value: 'betaflight', label: 'Betaflight RC/Super/Expo' },
-        { value: 'actual', label: 'Actual Rates (BF 4.3+)' },
-      ],
-      value: settings.get('rateMode'),
-      onChange: (v) => { settings.set('rateMode', v); changed(); this.render(); },
-    }));
-    if (settings.get('rateMode') === 'actual') {
-      for (const axis of ['roll', 'pitch', 'yaw']) {
-        const prof = settings.get('actualProfile')[axis];
-        panel.append(sliderRow(`${cap(axis)} centre`, {
-          min: 10, max: 400, step: 5, value: prof.center,
-          format: (v) => `${Math.round(v)}°/s`,
-          onInput: (v) => {
-            const p = settings.get('actualProfile');
-            settings.set('actualProfile', { ...p, [axis]: { ...p[axis], center: v } });
-            settings.set('ratePreset', 'custom');
-            changed();
-          },
-        }));
-        panel.append(sliderRow(`${cap(axis)} expo`, {
-          min: 0, max: 1, step: 0.01, value: prof.expo,
-          format: (v) => `${Math.round(v * 100)}%`,
-          onInput: (v) => {
-            const p = settings.get('actualProfile');
-            settings.set('actualProfile', { ...p, [axis]: { ...p[axis], expo: v } });
-            settings.set('ratePreset', 'custom');
-            changed();
-          },
-        }));
-      }
-      const actualHint = document.createElement('p');
-      actualHint.className = 'hint';
-      actualHint.textContent =
-        'Centre = stick sensitivity near mid-stick, max = the deg/s ceilings above, ' +
-        'expo shifts the kink between them. Full stick always hits max.';
-      panel.append(actualHint);
-    } else {
-      for (const axis of ['roll', 'pitch', 'yaw']) {
-        const prof = settings.get('rateProfile')[axis];
-        for (const [key, label, min, max, step, fmt] of [
-          ['rcRate', 'RC rate', 0.5, 2.5, 0.05, (v) => v.toFixed(2)],
-          ['superRate', 'Super rate', 0, 1, 0.01, (v) => `${Math.round(v * 100)}%`],
-          ['expo', 'Expo', 0, 1, 0.01, (v) => `${Math.round(v * 100)}%`],
-        ]) {
-          panel.append(sliderRow(`${cap(axis)} ${label}`, {
-            min, max, step, value: prof[key], format: fmt,
-            onInput: (v) => {
-              const p = settings.get('rateProfile');
-              settings.set('rateProfile', { ...p, [axis]: { ...p[axis], [key]: v } });
-              settings.set('ratePreset', 'custom');
-              changed();
-            },
-          }));
-        }
-      }
-    }
+    /* ---- Betaflight ---- */
+    renderBetaflightTuning(panel, changed, () => this.render());
 
     /* ---- simulation ---- */
     panel.append(heading('Simulation'));
     panel.append(selectRow('Tick rate', {
       options: [
-        { value: '960', label: '960 Hz — maximum fidelity' },
-        { value: '480', label: '480 Hz — very high' },
-        { value: '240', label: '240 Hz — recommended' },
-        { value: '120', label: '120 Hz — lowest CPU cost' },
+        { value: '2000', label: '2 kHz — maximum fidelity' },
+        { value: '1000', label: '1 kHz — recommended' },
+        { value: '500', label: '500 Hz — lowest CPU cost' },
       ],
       value: String(settings.get('simRate')),
       onChange: (v) => { settings.set('simRate', parseInt(v, 10)); changed(); },
@@ -951,8 +1238,8 @@ export class MainMenu {
     const rateHint = document.createElement('p');
     rateHint.className = 'hint';
     rateHint.textContent =
-      'How often the flight controller runs. Higher means lower control latency and crisper stick ' +
-      'response; the tune is rate-independent, so the quad flies the same at every setting.';
+      'The Betaflight PID loop rate. Higher means lower control latency and cleaner filtering; ' +
+      'the filters are rebuilt for the new rate, as on a real flight controller.';
     panel.append(rateHint);
 
     panel.append(toggleRow('Adaptive quality', {
@@ -966,15 +1253,11 @@ export class MainMenu {
     panel.append(selectRow('Default flight mode', {
       options: [
         { value: 'angle', label: 'Angle — self-levelling (beginner)' },
+        { value: 'horizon', label: 'Horizon — levels at centre stick' },
         { value: 'acro', label: 'Acro — rate only (realistic)' },
       ],
       value: settings.get('flightMode'),
       onChange: (v) => { settings.set('flightMode', v); changed(); },
-    }));
-    panel.append(sliderRow('Angle-mode tilt limit', {
-      min: 10, max: 75, step: 1, value: settings.get('maxTilt'),
-      format: (v) => `${Math.round(v)}°`,
-      onInput: (v) => { settings.set('maxTilt', v); changed(); },
     }));
     panel.append(toggleRow('Wind (outdoor maps)', {
       value: settings.get('wind'),
@@ -984,10 +1267,37 @@ export class MainMenu {
 
     /* ---- camera ---- */
     panel.append(heading('Camera'));
-    panel.append(sliderRow('Field of view', {
-      min: 70, max: 155, step: 1, value: settings.get('fov'),
+    panel.append(selectRow('FPV lens', {
+      options: [
+        { value: 'fisheye', label: 'Fisheye — fast, full effects' },
+        { value: 'fisheye-cube', label: 'Fisheye (cube) — true 170°, fewer effects' },
+        { value: 'rectilinear', label: 'Rectilinear — flat perspective (max 150°)' },
+      ],
+      value: settings.get('fpvLens'),
+      onChange: (v) => { settings.set('fpvLens', v); changed(); this.render(); },
+    }));
+    if (settings.get('fpvLens') === 'fisheye-cube') {
+      const cubeHint = document.createElement('p');
+      cubeHint.className = 'hint';
+      cubeHint.textContent =
+        'Cube mode renders five camera faces per frame. Ambient occlusion, reflections, ' +
+        'temporal AA and motion blur are skipped in this mode.';
+      panel.append(cubeHint);
+    }
+    panel.append(sliderRow('Field of view (horizontal)', {
+      min: 70, max: 170, step: 1, value: settings.get('fov'),
       format: (v) => `${Math.round(v)}°`,
       onInput: (v) => { settings.set('fov', v); changed(); },
+    }));
+    panel.append(sliderRow('Fisheye strength', {
+      min: 0, max: 1, step: 0.01, value: settings.get('lensFisheye'),
+      format: (v) => `${Math.round(v * 100)}%`,
+      onInput: (v) => { settings.set('lensFisheye', v); changed(); },
+    }));
+    panel.append(toggleRow('Props in view', {
+      value: settings.get('propsInView'),
+      hint: 'Prop blur at the frame edges, like a real 5" on a wide lens.',
+      onChange: (v) => { settings.set('propsInView', v); changed(); },
     }));
     panel.append(sliderRow('Camera uptilt', {
       min: 0, max: 55, step: 1, value: settings.get('cameraTilt'),
@@ -1004,10 +1314,18 @@ export class MainMenu {
       format: (v) => `${v.toFixed(2)}x`,
       onInput: (v) => { settings.set('shake', v); changed(); },
     }));
-    panel.append(toggleRow('Analog goggle filter (CRT)', {
-      value: settings.get('crtFilter'),
-      hint: 'Scanlines, chromatic aberration, signal noise.',
-      onChange: (v) => { settings.set('crtFilter', v); changed(); },
+    panel.append(selectRow('Video system', {
+      options: [
+        { value: 'hd', label: 'HD digital (DJI O4 / Walksnail)' },
+        { value: 'analog', label: 'Analog 5.8 GHz (4:3, CRT goggle)' },
+      ],
+      value: settings.get('videoSystem'),
+      onChange: (v) => {
+        // Each system brings its own glass-to-glass latency.
+        settings.set({ videoSystem: v, fpvLatency: VIDEO_LATENCY_MS[v] ?? 28 });
+        changed();
+        this.render();
+      },
     }));
     panel.append(toggleRow('Artificial horizon ladder', {
       value: settings.get('horizonLadder'),
@@ -1027,6 +1345,19 @@ export class MainMenu {
       value: settings.get('graphicsQuality') || 'auto',
       onChange: (v) => { settings.set('graphicsQuality', v); changed(); },
     }));
+    panel.append(selectRow('Renderer', {
+      options: [
+        { value: 'auto', label: 'Auto — WebGPU, WebGL2 fallback' },
+        { value: 'webgpu', label: 'WebGPU' },
+        { value: 'webgl2', label: 'WebGL2 (compatibility)' },
+      ],
+      value: settings.get('renderBackend') || 'auto',
+      onChange: (v) => { settings.set('renderBackend', v); changed(); this.render(); },
+    }));
+    const beHint = document.createElement('p');
+    beHint.className = 'hint';
+    beHint.textContent = 'Renderer changes apply when the page is reloaded.';
+    panel.append(beHint);
     const qHint = document.createElement('p');
     qHint.className = 'hint';
     qHint.textContent =
@@ -1035,7 +1366,7 @@ export class MainMenu {
     panel.append(qHint);
     panel.append(toggleRow('Sun shadows', {
       value: settings.get('shadows'),
-      hint: 'Drone-following sun shadow map. Off = fastest.',
+      hint: 'Cascaded sun shadows outdoors (medium and up). Off = fastest.',
       onChange: (v) => { settings.set('shadows', v); changed(); },
     }));
     panel.append(toggleRow('Bloom glow', {
@@ -1050,7 +1381,7 @@ export class MainMenu {
     }));
     panel.append(toggleRow('Motion blur', {
       value: settings.get('motionBlur'),
-      hint: 'Speed-scaled smear in fast flight. One fullscreen pass.',
+      hint: 'Per-pixel velocity blur, stronger at speed.',
       onChange: (v) => { settings.set('motionBlur', v); changed(); },
     }));
 
