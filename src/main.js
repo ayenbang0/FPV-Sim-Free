@@ -33,11 +33,12 @@
  * --------------
  * The loop body is wrapped. A subsystem that throws gets logged and the frame
  * continues; only a long unbroken run of failures escalates to the fatal card.
- * WebGL context loss is handled explicitly, because on laptops with switchable
- * graphics it is a routine event rather than an exotic one.
+ * GPU device loss is handled explicitly (WebGPU `onDeviceLost`, WebGL context
+ * events), because on laptops with switchable graphics it is a routine event
+ * rather than an exotic one.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 
 import { PhysicsWorld } from './core/PhysicsWorld.js';
 import { DroneController } from './core/DroneController.js';
@@ -47,8 +48,10 @@ import { MapManager } from './core/MapManager.js';
 import { AudioEngine } from './core/AudioEngine.js';
 import { settings } from './core/Settings.js';
 import { Atmosphere } from './render/Atmosphere.js';
-import { resolveQuality, setActiveQuality, activeQuality } from './render/Quality.js';
+import { resolveQuality, setActiveQuality, activeQuality, detectQualityTier } from './render/Quality.js';
 import { setTextureAnisotropy } from './assets/procedural.js';
+import { installWebGpuCompat } from './render/webgpuCompat.js';
+import { FISHEYE_RESOLUTION_SCALE } from './render/FpvLens.js';
 
 import { MAP_REGISTRY } from './maps/registry.js';
 
@@ -133,7 +136,8 @@ class Simulator {
 
     this.dom.fatalReload?.addEventListener('click', () => location.reload());
 
-    if (!this._buildRenderer()) return;
+    if (!(await this._buildRenderer())) return;
+    await detectQualityTier(this.renderer);
     this._qualitySetting = settings.get('graphicsQuality');
     this._applyQualityTier(true);
 
@@ -145,6 +149,9 @@ class Simulator {
     this.scene.add(this.drone.object3d);
 
     this.camera = new CameraRig(this.renderer, this.scene);
+    this.camera.postStack.setQuality(activeQuality);
+    // Cascaded shadows split the pilot's view frustum.
+    this.atmosphere.setViewCamera(this.camera.camera);
     this.mapManager = new MapManager(this.scene, this.physics);
     this.input = new InputManager();
     this.audio = new AudioEngine();
@@ -166,51 +173,104 @@ class Simulator {
   }
 
   /**
-   * Create the WebGL renderer, degrading rather than failing: antialiasing and
-   * a high-performance GPU hint are requested but a context without them is
-   * accepted, and only a total inability to get any context is fatal.
+   * Create the renderer: three's WebGPURenderer, which drives either a WebGPU
+   * device or (with `forceWebGL`) a WebGL2 context through the same node
+   * materials and post pipeline.
+   *
+   * Fallback chain: WebGPU, then WebGL2, then the fatal card. The
+   * `renderBackend` setting ('auto' | 'webgpu' | 'webgl2') picks the first
+   * rung; 'webgl2' skips WebGPU entirely. `init()` is async (it requests the
+   * adapter and device), so the first frame waits for it.
    */
-  _buildRenderer() {
-    const attempts = [
-      { antialias: true, powerPreference: 'high-performance' },
-      { antialias: false, powerPreference: 'default' },
-      {},
-    ];
+  async _buildRenderer() {
+    installWebGpuCompat();
+    const pref = settings.get('renderBackend');
+    const attempts = pref === 'webgl2' ? [true] : [false, true];
 
-    for (const opts of attempts) {
+    for (const forceWebGL of attempts) {
+      let renderer = null;
       try {
-        const renderer = new THREE.WebGLRenderer({ ...opts, alpha: false, stencil: false });
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        renderer = new THREE.WebGPURenderer({
+          antialias: false,
+          powerPreference: 'high-performance',
+          forceWebGL,
+        });
+        await renderer.init();
+        renderer.setPixelRatio(this._effectivePixelRatio());
         renderer.outputColorSpace = THREE.SRGBColorSpace;
+        // ACES: the per-map exposures in Atmosphere are tuned for it.
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
         renderer.toneMappingExposure = 1.05;
-        // One cheap shadow map: static scenes mean the cost is mostly the
-        // single 1024px render, and contact shadows ground the drone visually.
         // Disabled entirely when the shadows setting is off (see _applySettings).
         renderer.shadowMap.enabled = settings.get('shadows') !== false;
-        renderer.shadowMap.type = THREE.PCFShadowMap;
-        renderer.shadowMap.autoUpdate = true;
-        this.renderer = renderer;
-        this.dom.container.appendChild(renderer.domElement);
-        this._bindContextLoss(renderer.domElement);
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        this._adoptRenderer(renderer);
+        const kind = renderer.backend?.isWebGPUBackend ? 'WebGPU' : 'WebGL2';
+        console.info(`[main] renderer: ${kind}`);
         return true;
       } catch (err) {
-        console.warn('[main] renderer attempt failed', opts, err);
+        console.warn(`[main] renderer attempt failed (${forceWebGL ? 'WebGL2' : 'WebGPU'})`, err);
+        try { renderer?.dispose(); } catch (_e) { /* ignore */ }
       }
     }
 
     this._fatal(
-      'Could not create a WebGL context.\n\n' +
-      'This simulator needs hardware-accelerated WebGL. Check that it is enabled in your ' +
+      'Could not create a WebGPU or WebGL2 context.\n\n' +
+      'This simulator needs hardware-accelerated graphics. Check that it is enabled in your ' +
       'browser settings, or try a different browser.',
     );
     return false;
   }
 
+  /** Install a freshly initialised renderer: canvas, loss handlers, consumers. */
+  _adoptRenderer(renderer) {
+    const old = this.renderer;
+    this.renderer = renderer;
+    if (old?.domElement?.parentNode) old.domElement.remove();
+    this.dom.container.appendChild(renderer.domElement);
+
+    // WebGPU reports device loss through the renderer; the WebGL backend
+    // reports it through canvas events. Both rebuild through the same chain.
+    renderer.onDeviceLost = (info) => this._onDeviceLost(info);
+    if (renderer.backend?.isWebGLBackend) this._bindContextLoss(renderer.domElement);
+
+    // Consumers created before a rebuild hold the old renderer.
+    if (this.atmosphere) this.atmosphere.renderer = renderer;
+    if (this.camera) this.camera.setRenderer(renderer);
+    if (old && old !== renderer) {
+      try { old.dispose(); } catch (_e) { /* ignore */ }
+    }
+  }
+
   /**
-   * Context loss happens for mundane reasons (GPU switch, driver reset, laptop
-   * waking from sleep). Calling preventDefault lets the browser restore it;
-   * without that the canvas stays black forever and looks like a hard crash.
+   * GPU device lost (driver reset, GPU switch, a laptop waking from sleep).
+   * Build a new renderer through the same fallback chain and hand it to every
+   * consumer; the scene graph keeps its CPU-side data, so everything re-uploads.
+   */
+  async _onDeviceLost(info) {
+    if (this._rebuilding) return;
+    this._rebuilding = true;
+    this._contextLost = true;
+    if (this.state === 'flying') this.pause();
+    this.toast('danger', 'Graphics device lost — rebuilding the renderer.');
+    console.warn('[main] device lost', info);
+    try {
+      const ok = await this._buildRenderer();
+      if (ok) {
+        this._contextLost = false;
+        this._resize();
+        try { this.atmosphere?.rebuildEnvironment?.(); } catch (_e) { /* ignore */ }
+        this.toast('info', 'Graphics restored.');
+      }
+    } finally {
+      this._rebuilding = false;
+    }
+  }
+
+  /**
+   * WebGL backend only. Calling preventDefault lets the browser restore the
+   * context; without that the canvas stays black forever and looks like a
+   * hard crash.
    */
   _bindContextLoss(canvas) {
     canvas.addEventListener('webglcontextlost', (e) => {
@@ -224,7 +284,7 @@ class Simulator {
       this._contextLost = false;
       this.toast('info', 'Graphics context restored.');
       try {
-        this.renderer.setPixelRatio(this._pixelRatio);
+        this.renderer.setPixelRatio(this._effectivePixelRatio());
         this._resize();
       } catch (_e) { /* ignore */ }
     }, false);
@@ -243,18 +303,21 @@ class Simulator {
    */
   _applyQualityTier(initial = false) {
     try {
-      const q = resolveQuality(settings.get('graphicsQuality'), this.renderer);
+      const q = resolveQuality(settings.get('graphicsQuality'));
       const changed = this._qualityTier !== q.tier;
       this._qualityTier = q.tier;
       setActiveQuality(q);
+      // A new tier restores every effect the performance guard shed.
+      this._effectsReduced = 0;
+      this.camera?.postStack?.setQuality(activeQuality);
       let maxAniso = 4;
-      try { maxAniso = this.renderer.capabilities.getMaxAnisotropy(); } catch (_e) { /* ignore */ }
+      try { maxAniso = this.renderer.getMaxAnisotropy(); } catch (_e) { /* ignore */ }
       setTextureAnisotropy(Math.min(q.anisotropy || 4, maxAniso || 4));
       this._maxPixelRatio = Math.min(window.devicePixelRatio || 1, q.pixelRatioCap || 2);
       if (initial || this._pixelRatio > this._maxPixelRatio) {
         this._pixelRatio = this._maxPixelRatio;
         if (!initial) this._applyPixelRatio();
-        else this.renderer.setPixelRatio(this._pixelRatio);
+        else this.renderer.setPixelRatio(this._effectivePixelRatio());
       }
       if (!initial && changed) {
         this.atmosphere?.applyQuality();
@@ -455,6 +518,12 @@ class Simulator {
     );
     this.drone.windEnabled = this._windAllowed();
     this._configureEnvironment(map);
+    this.camera.postStack.setEnvironment({
+      outdoor: this.atmosphere.mode === 'outdoor',
+      // Maps that build sunbeam cards through skylights get real godrays too.
+      godrays: !!map?.environment?.godrays,
+      sun: this.atmosphere.sun,
+    });
     this._applyViewDistance();
     this.camera.setLinkProfile?.(map?.link || null);
     this.respawn({ full: true, silent: true });
@@ -676,6 +745,8 @@ class Simulator {
         this._pixelRatio = Math.max(0.75, this._pixelRatio - 0.25);
         this._applyPixelRatio();
         perf.lastAdapt = now;
+      } else if (!physicsBound && this._reduceEffects()) {
+        perf.lastAdapt = now;
       } else if (physicsBound) {
         this._stepDownSimRate();
         perf.lastAdapt = now;
@@ -687,9 +758,45 @@ class Simulator {
     }
   }
 
+  /**
+   * Second rung, once the pixel ratio is already on its 0.75 floor: shed the
+   * most expensive post effects — GTAO first, then TRAA for SMAA. Returns
+   * true when something was dropped. A tier change restores them.
+   */
+  _reduceEffects() {
+    const stack = this.camera?.postStack;
+    if (!stack) return false;
+    const level = this._effectsReduced | 0;
+    const reduced = { ...activeQuality };
+    if (level === 0 && activeQuality.gtao) {
+      reduced.gtao = false;
+      this._effectsReduced = 1;
+    } else if (level <= 1 && activeQuality.aa === 'traa') {
+      reduced.gtao = false;
+      reduced.aa = 'smaa';
+      this._effectsReduced = 2;
+    } else {
+      return false;
+    }
+    stack.setQuality(reduced);
+    this.toast('warn', 'Reduced effects for frame rate');
+    return true;
+  }
+
+  /**
+   * The renderer's pixel ratio: the adaptive base, times the fisheye lens's
+   * 1.25x supersample (its centre is magnified from a rectilinear render).
+   * Scaling the whole drawing buffer rather than just the scene pass keeps
+   * every buffer the same size, which TRAA's depth history requires.
+   */
+  _effectivePixelRatio() {
+    const base = this._pixelRatio || Math.min(window.devicePixelRatio || 1, 2);
+    return base * (settings.get('fpvLens') === 'fisheye' ? FISHEYE_RESOLUTION_SCALE : 1);
+  }
+
   _applyPixelRatio() {
     try {
-      this.renderer.setPixelRatio(this._pixelRatio);
+      this.renderer.setPixelRatio(this._effectivePixelRatio());
       this._resize();
     } catch (err) {
       console.warn('[main] could not change pixel ratio', err);
@@ -752,7 +859,7 @@ class Simulator {
   _renderFrame(alpha, renderDt) {
     this.drone.applyInterpolation(alpha, this._interpPos, this._interpQuat);
     this.drone.updateVisuals(renderDt);
-    this.drone.object3d.visible = this.camera.showsDroneBody;
+    this.drone.setViewMode(!this.camera.showsDroneBody, settings.get('propsInView') !== false);
 
     this.camera.update(renderDt, this._interpPos, this._interpQuat, this.drone);
     this.mapManager.update(renderDt, this.elapsed);
@@ -1014,7 +1121,7 @@ class Simulator {
     // The new mesh is a new object; re-add it and re-apply the FPV visibility
     // rule, or the chase camera ends up looking at nothing.
     if (this.drone.object3d.parent !== this.scene) this.scene.add(this.drone.object3d);
-    this.drone.object3d.visible = this.camera.showsDroneBody;
+    this.drone.setViewMode(!this.camera.showsDroneBody, settings.get('propsInView') !== false);
 
     this.physics.protect(this.drone.body);
 
@@ -1031,6 +1138,9 @@ class Simulator {
     try {
       this.setSimRate(settings.get('simRate'));
       this.camera.applySettings();
+      if (this.renderer && Math.abs(this.renderer.getPixelRatio() - this._effectivePixelRatio()) > 1e-6) {
+        this._applyPixelRatio();
+      }
       this.audio.applySettings();
       this.hud.setVisible(settings.get('hudVisible'));
       if (this.renderer) {

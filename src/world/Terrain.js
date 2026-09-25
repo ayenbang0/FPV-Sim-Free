@@ -26,7 +26,7 @@
  * two kilometres at the cost of one texture.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { GROUP } from '../core/PhysicsWorld.js';
 import { activeQuality } from '../render/Quality.js';

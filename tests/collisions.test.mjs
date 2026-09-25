@@ -12,7 +12,7 @@
  *
  * Run with:  npm test
  */
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { PhysicsWorld } from '../src/core/PhysicsWorld.js';
 import { DroneController } from '../src/core/DroneController.js';

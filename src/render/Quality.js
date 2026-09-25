@@ -9,9 +9,21 @@
  * outdoor maps flyable on integrated graphics (an Iris Xe laptop is the
  * reference low end) while a discrete GPU gets dense meadows and long views.
  *
- * `auto` resolves once at boot from the WebGL renderer string: integrated and
- * mobile GPUs start on `medium`, everything else on `high`. Adaptive quality
- * in main.js still walks the pixel ratio down on top of whichever tier is set.
+ * `auto` resolves once at boot from the GPU adapter (see detectQualityTier):
+ * software adapters start on `low`, older integrated parts on `medium`,
+ * everything else on `high`. Adaptive quality in main.js still walks the pixel
+ * ratio down on top of whichever tier is set, then sheds GTAO and TRAA.
+ *
+ * Post-processing budget per tier (see render/PostStack.js):
+ *
+ *   field        low     medium          high    ultra
+ *   gtao         false   true (half res) true    true
+ *   ssr          false   false           false   true
+ *   aa           smaa    smaa            traa    traa
+ *   lensflare    false   true            true    true
+ *   csmCascades  0       2               3       4
+ *   cubeFaceSize 384     512             768     1024
+ *   godrays      false   false           true    true
  */
 
 export const QUALITY_TIERS = ['low', 'medium', 'high', 'ultra'];
@@ -32,8 +44,15 @@ export const QUALITY_PRESETS = {
     terrainLodScale: 0.7,
     envMapSize: 128,
     viewDistance: 2600,
-    antialias: false,
     detailProps: 0.5,
+    gtao: false,
+    gtaoHalfRes: false,
+    ssr: false,
+    aa: 'smaa',
+    lensflare: false,
+    csmCascades: 0,
+    cubeFaceSize: 384,
+    godrays: false,
   },
   medium: {
     label: 'Medium — balanced',
@@ -50,8 +69,15 @@ export const QUALITY_PRESETS = {
     terrainLodScale: 1.0,
     envMapSize: 256,
     viewDistance: 3600,
-    antialias: true,
     detailProps: 0.8,
+    gtao: true,
+    gtaoHalfRes: true,
+    ssr: false,
+    aa: 'smaa',
+    lensflare: true,
+    csmCascades: 2,
+    cubeFaceSize: 512,
+    godrays: false,
   },
   high: {
     label: 'High — discrete GPUs',
@@ -68,8 +94,15 @@ export const QUALITY_PRESETS = {
     terrainLodScale: 1.4,
     envMapSize: 256,
     viewDistance: 5200,
-    antialias: true,
     detailProps: 1.0,
+    gtao: true,
+    gtaoHalfRes: false,
+    ssr: false,
+    aa: 'traa',
+    lensflare: true,
+    csmCascades: 3,
+    cubeFaceSize: 768,
+    godrays: true,
   },
   ultra: {
     label: 'Ultra — high-end GPUs',
@@ -86,30 +119,71 @@ export const QUALITY_PRESETS = {
     terrainLodScale: 2.0,
     envMapSize: 512,
     viewDistance: 7000,
-    antialias: true,
     detailProps: 1.0,
+    gtao: true,
+    gtaoHalfRes: false,
+    ssr: true,
+    aa: 'traa',
+    lensflare: true,
+    csmCascades: 4,
+    cubeFaceSize: 1024,
+    godrays: true,
   },
 };
 
 let _detectedTier = null;
 
 /**
- * Guess a sensible starting tier from the GPU the browser reports. Wrapped:
- * the debug-renderer extension is optional and some privacy modes strip it,
- * in which case `medium` is the safe middle.
+ * Guess a sensible starting tier from the GPU the browser reports. Async,
+ * because the WebGPU adapter description is only available from
+ * `navigator.gpu.requestAdapter()`.
+ *
+ *   WebGPU backend:  the adapter info (vendor, architecture, description) of
+ *                    the renderer's device (`device.adapterInfo`).
+ *                    A software/fallback adapter is `low`; Intel or Apple
+ *                    parts whose architecture reads gen-9/11/12 or M1 are
+ *                    `medium`; anything else is `high`.
+ *   WebGL backend:   the unmasked renderer string from
+ *                    WEBGL_debug_renderer_info, through `renderer.backend.gl`.
+ *
+ * Any error — no adapter, a privacy mode that strips the strings — is
+ * `medium`, the safe middle.
  */
-export function detectQualityTier(renderer) {
+export async function detectQualityTier(renderer) {
   if (_detectedTier) return _detectedTier;
   let tier = 'medium';
   try {
-    const gl = renderer?.getContext?.();
-    const ext = gl?.getExtension?.('WEBGL_debug_renderer_info');
-    const name = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '').toLowerCase();
-    if (!name) tier = 'medium';
-    else if (/swiftshader|llvmpipe|software|microsoft basic/.test(name)) tier = 'low';
-    else if (/intel|iris|uhd|hd graphics|mali|adreno|powervr|apple gpu|videocore/.test(name)) tier = 'medium';
-    else if (/rtx|radeon rx|rx [5-9]\d{3}|gtx 1[06-9]|gtx 16|arc a/.test(name)) tier = 'high';
-    else tier = 'high';
+    const backend = renderer?.backend;
+    if (backend?.isWebGPUBackend === true && typeof navigator !== 'undefined' && navigator.gpu) {
+      // Prefer the renderer's own device: requesting a second adapter can
+      // invalidate the first on some Chrome builds (a spurious device loss).
+      let info = backend.device?.adapterInfo || null;
+      let fallback = info?.isFallbackAdapter === true;
+      if (!info) {
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        if (!adapter) throw new Error('no WebGPU adapter');
+        info = adapter.info || {};
+        fallback = adapter.isFallbackAdapter === true || info.isFallbackAdapter === true;
+      }
+      const vendor = String(info?.vendor || '').toLowerCase();
+      const arch = String(info?.architecture || '').toLowerCase();
+      const desc = String(info?.description || '').toLowerCase();
+      if (fallback || /swiftshader|llvmpipe|software|microsoft basic/.test(`${vendor} ${arch} ${desc}`)) {
+        tier = 'low';
+      } else if (/intel|apple/.test(vendor) && /gen-?(9|11|12)|m1$/i.test(arch)) {
+        tier = 'medium';
+      } else {
+        tier = 'high';
+      }
+    } else {
+      const gl = backend?.gl || renderer?.getContext?.();
+      const ext = gl?.getExtension?.('WEBGL_debug_renderer_info');
+      const name = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '').toLowerCase();
+      if (!name) tier = 'medium';
+      else if (/swiftshader|llvmpipe|software|microsoft basic/.test(name)) tier = 'low';
+      else if (/intel|iris|uhd|hd graphics|mali|adreno|powervr|apple gpu|videocore/.test(name)) tier = 'medium';
+      else tier = 'high';
+    }
   } catch (_e) {
     tier = 'medium';
   }
@@ -117,9 +191,14 @@ export function detectQualityTier(renderer) {
   return tier;
 }
 
+/** The tier `auto` resolved to at boot (null before detection has run). */
+export function detectedQualityTier() {
+  return _detectedTier;
+}
+
 /** Resolve a stored setting ('auto' | tier) into a concrete preset object. */
-export function resolveQuality(setting, renderer) {
-  const tier = QUALITY_TIERS.includes(setting) ? setting : detectQualityTier(renderer);
+export function resolveQuality(setting) {
+  const tier = QUALITY_TIERS.includes(setting) ? setting : (_detectedTier || 'medium');
   return { tier, ...QUALITY_PRESETS[tier] };
 }
 

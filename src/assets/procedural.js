@@ -19,7 +19,7 @@ import {
   SRGBColorSpace,
   LinearMipmapLinearFilter,
   LinearFilter,
-} from 'three';
+} from 'three/webgpu';
 
 /* ========================================================================== *
  * Deterministic randomness
@@ -590,6 +590,77 @@ export function paintedMetalTexture(seed = 41, repeat = [2, 2], base = [150, 152
     paintNoise(ctx, size, rng, lo, hi, 4, 3, 0.9);
     speckle(ctx, size, rng, 260, 1.1, (r) => `rgba(60,60,64,${0.05 + r() * 0.18})`);
   }, { repeat });
+}
+
+/**
+ * 2×2 twill carbon fibre: each tow passes over two and under two, and every
+ * row shifts by one, which lays the characteristic diagonal chevrons across
+ * the weave. Each tow is shaded along its length so the clear-coat reads the
+ * weave under a moving light.
+ */
+export function carbonWeaveTexture(seed = 52, repeat = [4, 4]) {
+  return safeTexture(256, seed, (ctx, size, rng) => {
+    const tows = 16;
+    const cell = size / tows;
+    ctx.fillStyle = 'rgb(14,15,17)';
+    ctx.fillRect(0, 0, size, size);
+    for (let j = 0; j < tows; j++) {
+      for (let i = 0; i < tows; i++) {
+        const warpOver = ((i + j) & 3) < 2;
+        const x = i * cell;
+        const y = j * cell;
+        const g = warpOver
+          ? ctx.createLinearGradient(x, y, x + cell, y)
+          : ctx.createLinearGradient(x, y, x, y + cell);
+        const lift = warpOver ? 10 : 0;
+        const tone = 30 + Math.floor(rng() * 8) + lift;
+        g.addColorStop(0, `rgb(${tone - 16},${tone - 15},${tone - 13})`);
+        g.addColorStop(0.5, `rgb(${tone + 16},${tone + 17},${tone + 20})`);
+        g.addColorStop(1, `rgb(${tone - 16},${tone - 15},${tone - 13})`);
+        ctx.fillStyle = g;
+        ctx.fillRect(x + 0.5, y + 0.5, cell - 1, cell - 1);
+        // Filament streaks along the tow.
+        ctx.strokeStyle = 'rgba(90,94,102,0.18)';
+        ctx.lineWidth = 0.6;
+        for (let k = 1; k < 4; k++) {
+          ctx.beginPath();
+          if (warpOver) { ctx.moveTo(x + (k * cell) / 4, y + 1); ctx.lineTo(x + (k * cell) / 4, y + cell - 1); }
+          else { ctx.moveTo(x + 1, y + (k * cell) / 4); ctx.lineTo(x + cell - 1, y + (k * cell) / 4); }
+          ctx.stroke();
+        }
+      }
+    }
+  }, { repeat });
+}
+
+/**
+ * Motion-blurred propeller disc: transparent at the hub, a faint translucent
+ * annulus with the blades' averaged silhouette (denser toward the root, where
+ * the chord is widest), and a soft fade at the tip.
+ */
+export function propDiscTexture(seed = 53) {
+  return safeTexture(128, seed, (ctx, size) => {
+    const c = size / 2;
+    ctx.clearRect(0, 0, size, size);
+    const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+    g.addColorStop(0.0, 'rgba(255,255,255,0)');
+    g.addColorStop(0.12, 'rgba(255,255,255,0)');
+    g.addColorStop(0.18, 'rgba(255,255,255,0.75)');
+    g.addColorStop(0.45, 'rgba(255,255,255,0.55)');
+    g.addColorStop(0.8, 'rgba(255,255,255,0.32)');
+    g.addColorStop(0.94, 'rgba(255,255,255,0.18)');
+    g.addColorStop(1.0, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    // Faint concentric banding: blade tips and the pitch change along the span.
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    for (const r of [0.32, 0.58, 0.86]) {
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(c, c, r * c, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }, { repeat: [1, 1] });
 }
 
 /**

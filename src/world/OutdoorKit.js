@@ -16,7 +16,7 @@
  * surface the drone actually collides with.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { Terrain } from './Terrain.js';
 import { createTerrainMaterial } from './TerrainMaterial.js';
 import {
@@ -24,6 +24,7 @@ import {
   forestFloorTexture, waterNormalTexture,
 } from './TerrainTextures.js';
 import { Grass } from './Grass.js';
+import { createWater } from './Water.js';
 import { Forest, coniferGeometry, broadleafGeometry } from './Forest.js';
 import { activeQuality } from '../render/Quality.js';
 import { foliageTexture, barkTexture } from '../assets/procedural.js';
@@ -64,7 +65,6 @@ export class OutdoorWorld {
     this.grass = null;
     this.forest = null;
     this.water = null;
-    this._waterNormal = null;
     this._t = 0;
   }
 
@@ -144,32 +144,21 @@ export class OutdoorWorld {
     }
   }
 
-  /** Open water: one large plane with scrolling ripple normals. */
+  /**
+   * Open water: one large WaterMesh (planar reflection + scrolling ripple
+   * normals, see world/Water.js). The collider is unchanged: a soft slab.
+   */
   _buildWater() {
     const t = this.terrain;
     const nrm = cachedTexture('water-normal', () => waterNormalTexture(71, 256));
-    const mat = this.b.material('water', () => new THREE.MeshStandardMaterial({
-      color: 0x1b3a46, roughness: 0.06, metalness: 0.0,
-      normalMap: nrm || null,
-      normalScale: new THREE.Vector2(0.35, 0.35),
-      transparent: true, opacity: 0.88,
-    }));
-    if (nrm) {
-      // The cached texture is shared: give this map its own repeat/offset.
-      const own = nrm.clone();
-      own.repeat.set(t.size / 14, t.size / 14);
-      own.needsUpdate = true;
-      this.b.tex(own);
-      mat.normalMap = own;
-      this._waterNormal = own;
-    }
     const geo = this.b.geometry('water-plane', () => new THREE.PlaneGeometry(t.size * 1.6, t.size * 1.6));
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = createWater(geo, { normals: nrm, waterColor: 0x1b3a46, size: 6 });
     mesh.rotation.x = -Math.PI / 2;
     mesh.position.y = this.waterLevel;
     mesh.receiveShadow = true;
     mesh.renderOrder = 1;
     this.b.root.add(mesh);
+    this.b.material('water', () => mesh.material);
     this.water = mesh;
     // Water is solid: ditching ends the run. Soft, so skimming bounces rather
     // than stops, the way a quad skips off a lake surface.
@@ -210,9 +199,6 @@ export class OutdoorWorld {
     try { this.terrain.mesh?.update(cameraPos); } catch (_e) { /* keep last LOD */ }
     this.grass?.update(cameraPos, step);
     this.forest?.update(cameraPos);
-    if (this._waterNormal) {
-      this._waterNormal.offset.set((this._t * 0.012) % 1, (this._t * 0.007) % 1);
-    }
   }
 
   /** Build every chunk's LOD for the spawn view before the first frame. */

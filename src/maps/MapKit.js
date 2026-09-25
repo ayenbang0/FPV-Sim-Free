@@ -27,7 +27,7 @@
  * API is identical either way.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { GROUP } from '../core/PhysicsWorld.js';
@@ -697,7 +697,9 @@ export class MapBuilder {
   _gateLedMaterials() {
     return {
       idle: this.material('gate-led-idle', () => new THREE.MeshStandardMaterial({
-        color: 0x16305c, emissive: GATE_COLORS.idle, emissiveIntensity: 0.9,
+        // 2.4 clears the post pipeline's 0.9 bloom threshold, so idle gate
+        // LEDs glow like the real strips do on camera.
+        color: 0x16305c, emissive: GATE_COLORS.idle, emissiveIntensity: 2.4,
         roughness: 0.5, metalness: 0.1,
       })),
       active: this.material('gate-led-active', () => new THREE.MeshStandardMaterial({

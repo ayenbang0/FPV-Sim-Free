@@ -22,7 +22,7 @@
  * environment map, which is what makes the polished floor reflect the rigs.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import {
   concreteTexture, corrugatedMetalTexture, paintedMetalTexture, fabricTexture,

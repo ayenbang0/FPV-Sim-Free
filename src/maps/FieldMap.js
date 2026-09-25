@@ -19,7 +19,7 @@
  * finishing through the barn.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import { OutdoorWorld, scatter } from '../world/OutdoorKit.js';
 import { Simplex, smoothstep, smoothPath, DistanceField } from '../world/Noise.js';
@@ -27,6 +27,7 @@ import {
   barnWoodTexture, corrugatedMetalTexture, dirtTexture, brickTexture, paintedMetalTexture,
 } from '../assets/procedural.js';
 import { waterNormalTexture } from '../world/TerrainTextures.js';
+import { createWater } from '../world/Water.js';
 
 const CELL = 3;
 const CHUNK_CELLS = 64;
@@ -314,17 +315,14 @@ export class FieldMap {
   _buildPond(b) {
     const y = POND_H;
     const nrm = b.tex(waterNormalTexture(3701, 256));
-    if (nrm) nrm.repeat.set(4, 4);
-    const mat = b.material('pond-water', () => new THREE.MeshStandardMaterial({
-      color: 0x1d3c40, roughness: 0.05, metalness: 0, normalMap: nrm || null,
-      normalScale: new THREE.Vector2(0.3, 0.3), transparent: true, opacity: 0.9,
-    }));
-    this._pondNormal = nrm;
     const geo = b.geometry('pond', () => new THREE.CircleGeometry(POND.r + 3, 48));
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = createWater(geo, { normals: nrm, waterColor: 0x1d3c40, size: 8, distortion: 2.5 });
     mesh.rotation.x = -Math.PI / 2;
     mesh.position.set(POND.x, y, POND.z);
+    mesh.receiveShadow = true;
     b.root.add(mesh);
+    // Registered with the kit so the map's teardown disposes it.
+    const mat = b.material('pond-water', () => mesh.material);
     b.cylinder({ radiusTop: POND.r + 2, radiusBottom: POND.r + 2, height: 1, segments: 16, position: [POND.x, y - 0.5, POND.z], material: mat, collide: true, surface: 'soft' }).visible = false;
     // Reeds around the rim.
     const reedGeo = b.geometry('reed', () => new THREE.ConeGeometry(0.05, 1.4, 4));
@@ -527,7 +525,6 @@ export class FieldMap {
   }
 
   update(dt, elapsed) {
-    if (this._pondNormal) this._pondNormal.offset.set((elapsed * 0.01) % 1, (elapsed * 0.006) % 1);
   }
 
   dispose(scene, physics) {

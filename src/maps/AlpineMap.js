@@ -18,7 +18,7 @@
  * chunks and streamed colliders keep the physics cost the same as a room.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { MapBuilder, rnd } from './MapKit.js';
 import { OutdoorWorld, scatter } from '../world/OutdoorKit.js';
 import { Simplex, smoothstep, clamp, DistanceField, smoothPath } from '../world/Noise.js';

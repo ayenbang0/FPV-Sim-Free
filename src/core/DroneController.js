@@ -33,11 +33,11 @@
  *   Measured body rates are negated into this frame (see `_readBodyRates`).
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { GROUP, clampSafe, isFiniteVec } from './PhysicsWorld.js';
 import { settings } from './Settings.js';
-import { paintedMetalTexture } from '../assets/procedural.js';
+import { buildDroneModel } from '../render/DroneModel.js';
 import { getAirframe, DEFAULT_DRONE_TYPE, WIND_PRESSURE } from './DroneTypes.js';
 import { blackbox } from './Blackbox.js';
 
@@ -337,108 +337,26 @@ export class DroneController {
   }
 
   /**
-   * A procedural airframe sized from the spec. Invisible in FPV (that is the
-   * whole point of first-person view) but needed for the chase and cinematic
-   * cameras, and for the model shown on the selection screen.
-   *
-   * The whoop gets prop ducts, which is most of what makes it recognisable at
-   * a glance; the other two get bare arms and exposed props.
+   * The visible quad (render/DroneModel.js), sized from the spec. Hidden in
+   * FPV except for the prop-blur discs; drawn in the chase and cinematic
+   * views and on the selection screen.
    */
   _buildMesh() {
-    const v = this.spec.visual;
-    const arm = this.spec.arm;
-    const [bw, bh, bd] = this.spec.body;
-
-    this.object3d = new THREE.Group();
-    this.object3d.name = 'drone';
-
-    const carbonTex = paintedMetalTexture(51, [1, 1], [42, 44, 48]);
-    const carbon = new THREE.MeshStandardMaterial({
-      color: v.bodyColor, roughness: 0.62, metalness: 0.25, map: carbonTex,
-    });
-    const accent = new THREE.MeshStandardMaterial({
-      color: v.accentColor, roughness: 0.4, metalness: 0.1,
-      emissive: v.accentColor, emissiveIntensity: 0.45,
-    });
-    const motorMat = new THREE.MeshStandardMaterial({
-      color: v.motorColor, roughness: 0.35, metalness: 0.85,
-    });
-    this._materials = [carbon, accent, motorMat];
-    this._textures = [carbonTex];
-    this._geometries = [];
-
-    const track = (geo) => { this._geometries.push(geo); return geo; };
-
-    // Centre stack, proportioned to the frame rather than fixed in metres.
-    const plate = new THREE.Mesh(
-      track(new THREE.BoxGeometry(bw * 0.42, bh * 0.45, bd * 0.55)), carbon,
-    );
-    this.object3d.add(plate);
-
-    const canopy = new THREE.Mesh(
-      track(new THREE.BoxGeometry(bw * 0.28, bh * 0.55, bd * 0.25)), accent,
-    );
-    canopy.position.set(0, bh * 0.42, -bd * 0.09);
-    this.object3d.add(canopy);
-
-    // Arms, motors, props.
-    this.propMeshes = [];
-    const armGeo = track(new THREE.BoxGeometry(arm * 0.19, arm * 0.09, arm * 1.28));
-    const motorGeo = track(new THREE.CylinderGeometry(
-      v.propRadius * 0.22, v.propRadius * 0.24, v.propRadius * 0.30, 10,
-    ));
-    const propGeo = track(new THREE.BoxGeometry(
-      v.propRadius * 2, v.propRadius * 0.028, v.propRadius * 0.17,
-    ));
-    const ductGeo = v.ducted
-      ? track(new THREE.TorusGeometry(v.propRadius * 1.08, v.propRadius * 0.12, 6, 18))
-      : null;
-
-    for (let i = 0; i < 4; i++) {
-      const sx = i === 0 || i === 2 ? -1 : 1;   // FL/RL are on -X
-      const sz = i < 2 ? -1 : 1;                // FL/FR are on -Z
-
-      const a = new THREE.Mesh(armGeo, carbon);
-      a.position.set(sx * arm * 0.55, 0, sz * arm * 0.55);
-      a.rotation.y = sx * sz > 0 ? Math.PI / 4 : -Math.PI / 4;
-      this.object3d.add(a);
-
-      const motor = new THREE.Mesh(motorGeo, motorMat);
-      motor.position.set(sx * arm, bh * 0.24, sz * arm);
-      this.object3d.add(motor);
-
-      const prop = new THREE.Mesh(propGeo, carbon);
-      prop.position.set(sx * arm, bh * 0.44, sz * arm);
-      this.object3d.add(prop);
-      this.propMeshes.push(prop);
-
-      if (ductGeo) {
-        const duct = new THREE.Mesh(ductGeo, accent);
-        duct.position.set(sx * arm, bh * 0.44, sz * arm);
-        duct.rotation.x = Math.PI / 2;   // torus lies in XY; lay it flat
-        this.object3d.add(duct);
-      }
-    }
-
-    this._propSpin = 0;
-
-    // The drone grounds itself with a real shadow in chase/cinematic views
-    // (invisible in FPV, where the body is hidden anyway). One small object.
-    this.object3d.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+    this.model = buildDroneModel(this.spec);
+    this.object3d = this.model.object3d;
+    this.propMeshes = this.model.propGroups;
   }
 
   /** Release the mesh's GPU resources. Used by setAirframe() and dispose(). */
   _disposeMesh() {
-    try {
-      this.object3d?.parent?.remove(this.object3d);
-      for (const g of this._geometries || []) g?.dispose?.();
-      for (const m of this._materials || []) m?.dispose?.();
-      for (const t of this._textures || []) t?.dispose?.();
-    } catch (_e) { /* teardown must never throw */ }
-    this._geometries = [];
-    this._materials = [];
-    this._textures = [];
+    try { this.model?.dispose(); } catch (_e) { /* teardown must never throw */ }
+    this.model = null;
     this.propMeshes = [];
+  }
+
+  /** FPV shows only the prop discs (if `propsInView`); other views show the quad. */
+  setViewMode(fpv, propsInView = true) {
+    this.model?.setFpv(fpv, propsInView);
   }
 
   /* ====================================================================== *
@@ -1529,22 +1447,16 @@ export class DroneController {
     this.object3d.quaternion.copy(outQuaternion);
   }
 
-  /** Spin the prop meshes at a rate that reads as motor load. */
+  /** Spin the props (and fade in the blur discs) at each motor's RPM. */
   updateVisuals(dtRender) {
-    if (!this.propMeshes) return;
-    // Armed props idle rather than stopping, matching the ESC idle offset the
-    // thrust curve applies. Deliberately read from the spec rather than folded
-    // into avgMotor: avgMotor feeds the battery model and the g-force readout,
-    // and an idle floor there would show the quad drawing current while sat
-    // disarmed on the bench.
-    const load = this.armed ? Math.max(this.avgMotor, this.spec.motorIdle) : 0;
-    const rate = this.armed ? 40 + load * 260 : 0;
-    this._propSpin = (this._propSpin + rate * dtRender) % (Math.PI * 2);
-    for (let i = 0; i < this.propMeshes.length; i++) {
-      // Alternate direction per diagonal, like a real quad.
-      const dir = i === 0 || i === 3 ? 1 : -1;
-      this.propMeshes[i].rotation.y = this._propSpin * dir;
+    if (!this.model) return;
+    const maxRpm = Number.isFinite(this.spec.motorMaxRPM) ? this.spec.motorMaxRPM : 30000;
+    const idle = this.armed ? this.spec.motorIdle : 0;
+    for (let i = 0; i < 4; i++) {
+      const cmd = this.armed ? Math.max(this.motorRPM[i], idle) : 0;
+      RPM_SCRATCH[i] = cmd * maxRpm;
     }
+    this.model.setRpm(RPM_SCRATCH, dtRender);
   }
 
   /** Reported to the HUD so the pilot knows why the motors cut. */
@@ -1558,12 +1470,7 @@ export class DroneController {
 
   dispose() {
     this.physics.removeBody(this.body);
-    try {
-      this.object3d.parent?.remove(this.object3d);
-      for (const g of this._geometries || []) g?.dispose?.();
-      for (const m of this._materials || []) m?.dispose?.();
-      for (const t of this._textures || []) t?.dispose?.();
-    } catch (_e) { /* teardown must never throw */ }
+    this._disposeMesh();
   }
 }
 
@@ -1573,6 +1480,7 @@ export class DroneController {
 
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const RATE_SCRATCH = { roll: 0, pitch: 0, yaw: 0 };
+const RPM_SCRATCH = [0, 0, 0, 0];
 
 function clamp(v, min, max) {
   return v < min ? min : v > max ? max : v;

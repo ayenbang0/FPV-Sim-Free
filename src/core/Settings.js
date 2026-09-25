@@ -89,7 +89,8 @@ export function defaultSettings() {
     rcLoss: 0,                  // 0..5 %
 
     /* ---- fpv video ---- */
-    fpvLatency: 28,             // 0..60 ms
+    videoSystem: 'hd',          // 'hd' (DJI O4 / Walksnail) | 'analog' (4:3, CRT goggle)
+    fpvLatency: 28,             // 0..60 ms; switching videoSystem in the UI writes 28 (HD) / 12 (analog)
     vtxBreakup: true,           // signal noise/tearing with distance
     vtxMode: 'distance',        // 'distance' (LOS falloff) | 'random' (link events)
 
@@ -102,17 +103,19 @@ export function defaultSettings() {
     blackbox: false,
 
     /* ---- camera ---- */
-    fov: 130,                   // deg, 90–150
+    fov: 145,                   // deg, 70–170: horizontal FOV of the FPV image
+    fpvLens: 'fisheye',         // 'rectilinear' | 'fisheye' | 'fisheye-cube' (see render/FpvLens.js)
+    lensFisheye: 0.8,           // 0 = pinhole, 1 = equidistant fisheye
+    propsInView: true,          // prop blur visible at the frame edges in FPV
     cameraTilt: 25,             // deg of uptilt on the cam mount
     cameraSmoothing: 0.75,      // 0 = rigid 1:1, 1 = very soft analog feel
-    crtFilter: false,           // analog-goggle post FX
-    lensDistortion: 0.14,       // 0..0.3 goggle barrel distortion; 0.14 = legacy FOV-linked look
     shake: 1.0,                 // camera-shake multiplier, 0 disables
 
     /* ---- graphics ---- */
     // Quality tier for the world renderer: shadow resolution, view distance,
     // grass/tree density, texture filtering. 'auto' picks from the GPU.
     graphicsQuality: 'auto',    // 'auto' | 'low' | 'medium' | 'high' | 'ultra'
+    renderBackend: 'auto',      // 'auto' | 'webgpu' | 'webgl2' — applies on reload
     shadows: true,              // sun shadow map (resolution follows the quality tier)
     bloom: false,               // selective glow on lamps/windows/emissives
     bloomStrength: 0.55,        // 0..1.2
@@ -294,6 +297,7 @@ function sanitize(raw) {
   d.rcLatencyMs = num(raw.rcLatencyMs, 0, 60, d.rcLatencyMs);
   d.rcLoss = num(raw.rcLoss, 0, 5, d.rcLoss);
 
+  d.videoSystem = oneOf(raw.videoSystem, ['hd', 'analog'], d.videoSystem);
   d.fpvLatency = num(raw.fpvLatency, 0, 60, d.fpvLatency);
   d.vtxBreakup = bool(raw.vtxBreakup, d.vtxBreakup);
   d.vtxMode = oneOf(raw.vtxMode, ['distance', 'random'], d.vtxMode);
@@ -304,14 +308,16 @@ function sanitize(raw) {
 
   d.blackbox = bool(raw.blackbox, d.blackbox);
 
-  d.fov = num(raw.fov, 70, 155, d.fov);
+  d.fov = num(raw.fov, 70, 170, d.fov);
+  d.fpvLens = oneOf(raw.fpvLens, ['rectilinear', 'fisheye', 'fisheye-cube'], d.fpvLens);
+  d.lensFisheye = num(raw.lensFisheye, 0, 1, d.lensFisheye);
+  d.propsInView = bool(raw.propsInView, d.propsInView);
   d.cameraTilt = num(raw.cameraTilt, 0, 55, d.cameraTilt);
   d.cameraSmoothing = num(raw.cameraSmoothing, 0, 1, d.cameraSmoothing);
-  d.crtFilter = bool(raw.crtFilter, d.crtFilter);
-  d.lensDistortion = num(raw.lensDistortion, 0, 0.3, d.lensDistortion);
   d.shake = num(raw.shake, 0, 2, d.shake);
 
   d.graphicsQuality = oneOf(raw.graphicsQuality, ['auto', 'low', 'medium', 'high', 'ultra'], d.graphicsQuality);
+  d.renderBackend = oneOf(raw.renderBackend, ['auto', 'webgpu', 'webgl2'], d.renderBackend);
   d.shadows = bool(raw.shadows, d.shadows);
   d.bloom = bool(raw.bloom, d.bloom);
   d.bloomStrength = num(raw.bloomStrength, 0, 1.2, d.bloomStrength);

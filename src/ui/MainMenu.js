@@ -16,6 +16,7 @@ import { settings, REMAPPABLE, defaultGamepadMapping, RATE_PRESETS, RATE_PRESET_
 import { CALIBRATABLE_AXES, CALIBRATION_STEPS, axisEndpoints } from '../core/InputManager.js';
 import { listAirframes, airframeStats } from '../core/DroneTypes.js';
 import { formatTime } from './HUD.js';
+import { VIDEO_LATENCY_MS } from '../render/FpvVideo.js';
 
 /* ========================================================================== *
  * Shared widgets
@@ -984,10 +985,37 @@ export class MainMenu {
 
     /* ---- camera ---- */
     panel.append(heading('Camera'));
-    panel.append(sliderRow('Field of view', {
-      min: 70, max: 155, step: 1, value: settings.get('fov'),
+    panel.append(selectRow('FPV lens', {
+      options: [
+        { value: 'fisheye', label: 'Fisheye — fast, full effects' },
+        { value: 'fisheye-cube', label: 'Fisheye (cube) — true 170°, fewer effects' },
+        { value: 'rectilinear', label: 'Rectilinear — flat perspective (max 150°)' },
+      ],
+      value: settings.get('fpvLens'),
+      onChange: (v) => { settings.set('fpvLens', v); changed(); this.render(); },
+    }));
+    if (settings.get('fpvLens') === 'fisheye-cube') {
+      const cubeHint = document.createElement('p');
+      cubeHint.className = 'hint';
+      cubeHint.textContent =
+        'Cube mode renders five camera faces per frame. Ambient occlusion, reflections, ' +
+        'temporal AA and motion blur are skipped in this mode.';
+      panel.append(cubeHint);
+    }
+    panel.append(sliderRow('Field of view (horizontal)', {
+      min: 70, max: 170, step: 1, value: settings.get('fov'),
       format: (v) => `${Math.round(v)}°`,
       onInput: (v) => { settings.set('fov', v); changed(); },
+    }));
+    panel.append(sliderRow('Fisheye strength', {
+      min: 0, max: 1, step: 0.01, value: settings.get('lensFisheye'),
+      format: (v) => `${Math.round(v * 100)}%`,
+      onInput: (v) => { settings.set('lensFisheye', v); changed(); },
+    }));
+    panel.append(toggleRow('Props in view', {
+      value: settings.get('propsInView'),
+      hint: 'Prop blur at the frame edges, like a real 5" on a wide lens.',
+      onChange: (v) => { settings.set('propsInView', v); changed(); },
     }));
     panel.append(sliderRow('Camera uptilt', {
       min: 0, max: 55, step: 1, value: settings.get('cameraTilt'),
@@ -1004,10 +1032,18 @@ export class MainMenu {
       format: (v) => `${v.toFixed(2)}x`,
       onInput: (v) => { settings.set('shake', v); changed(); },
     }));
-    panel.append(toggleRow('Analog goggle filter (CRT)', {
-      value: settings.get('crtFilter'),
-      hint: 'Scanlines, chromatic aberration, signal noise.',
-      onChange: (v) => { settings.set('crtFilter', v); changed(); },
+    panel.append(selectRow('Video system', {
+      options: [
+        { value: 'hd', label: 'HD digital (DJI O4 / Walksnail)' },
+        { value: 'analog', label: 'Analog 5.8 GHz (4:3, CRT goggle)' },
+      ],
+      value: settings.get('videoSystem'),
+      onChange: (v) => {
+        // Each system brings its own glass-to-glass latency.
+        settings.set({ videoSystem: v, fpvLatency: VIDEO_LATENCY_MS[v] ?? 28 });
+        changed();
+        this.render();
+      },
     }));
     panel.append(toggleRow('Artificial horizon ladder', {
       value: settings.get('horizonLadder'),
@@ -1027,6 +1063,19 @@ export class MainMenu {
       value: settings.get('graphicsQuality') || 'auto',
       onChange: (v) => { settings.set('graphicsQuality', v); changed(); },
     }));
+    panel.append(selectRow('Renderer', {
+      options: [
+        { value: 'auto', label: 'Auto — WebGPU, WebGL2 fallback' },
+        { value: 'webgpu', label: 'WebGPU' },
+        { value: 'webgl2', label: 'WebGL2 (compatibility)' },
+      ],
+      value: settings.get('renderBackend') || 'auto',
+      onChange: (v) => { settings.set('renderBackend', v); changed(); this.render(); },
+    }));
+    const beHint = document.createElement('p');
+    beHint.className = 'hint';
+    beHint.textContent = 'Renderer changes apply when the page is reloaded.';
+    panel.append(beHint);
     const qHint = document.createElement('p');
     qHint.className = 'hint';
     qHint.textContent =
@@ -1035,7 +1084,7 @@ export class MainMenu {
     panel.append(qHint);
     panel.append(toggleRow('Sun shadows', {
       value: settings.get('shadows'),
-      hint: 'Drone-following sun shadow map. Off = fastest.',
+      hint: 'Cascaded sun shadows outdoors (medium and up). Off = fastest.',
       onChange: (v) => { settings.set('shadows', v); changed(); },
     }));
     panel.append(toggleRow('Bloom glow', {
@@ -1050,7 +1099,7 @@ export class MainMenu {
     }));
     panel.append(toggleRow('Motion blur', {
       value: settings.get('motionBlur'),
-      hint: 'Speed-scaled smear in fast flight. One fullscreen pass.',
+      hint: 'Per-pixel velocity blur, stronger at speed.',
       onChange: (v) => { settings.set('motionBlur', v); changed(); },
     }));
 

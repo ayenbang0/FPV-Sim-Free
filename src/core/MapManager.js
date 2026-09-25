@@ -30,7 +30,7 @@
  * the simulator in a half-built state.
  */
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import * as CANNON from 'cannon-es';
 import { GROUP } from './PhysicsWorld.js';
 
